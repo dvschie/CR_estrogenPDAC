@@ -1,0 +1,2829 @@
+---
+title: "EstrogenPDAC_analysis"
+author: "Deni van Schie"
+date: "2025-03-23"
+output: html_document
+---
+
+```{r setup, include=FALSE, message=FALSE}
+# Load libraries and Set Seed
+suppressMessages({
+  .libPaths("~/R/x86_64-pc-linux-gnu-library/4.2/")
+  library(tidyverse)
+  library(BiocManager)
+  library(rlang)
+  library(dbplyr)
+  library(celldex)
+  library(SingleR)
+  library(progeny)
+  library(MAST)
+  library(destiny)
+  library(ggalluvial)
+  library(ggbeeswarm)
+  library(ggthemes)
+  library(magrittr)
+  library(RColorBrewer)
+  library(dplyr)
+  library(corrplot)
+  library(pheatmap)
+  library(ComplexHeatmap)
+  library(scales)
+  library(viridis)
+  library(circlize)
+  library(ggrepel)
+  library(Seurat)
+  library(SeuratData)
+  library(clustree)
+  library(gridExtra)
+  library(rstatix)
+  library(patchwork)
+  library(ggplot2)
+  library(data.table)
+  library(ggpubr)
+  library(SCpubr)
+  library(SeuratWrappers)
+  library(harmony)
+  library(splatter)
+  library(msigdbr)
+  library(GEOquery)
+  library(scater)
+  library(SingleCellExperiment)
+  library(viridisLite)
+  library(stringr)
+  library(colorRamps)
+  library(devtools)
+  library(SeuratObject)
+  library(Nebulosa)
+  library(parallel)
+  library(future)
+  library(future.apply)
+  library(clusterProfiler)
+  library(org.Hs.eg.db) # Replace with appropriate organism if not human
+  library(AUCell)
+  library(ggradar)
+  library(readxl)
+  library(singleseqgset)
+  library(scCustomize)
+  library(pals)
+  set.seed(1052)
+})
+```
+
+# Load and set up data
+
+```{r Loading counts cell- and sample level metadata + create seurat object}
+# Load in count data
+counts <- fread("data/CRA001160_normalized_count_matrix.txt", nThread = 32)
+rownames_counts <- counts[[1]]
+counts <- counts[, -1, with = FALSE]
+counts <- as.matrix(counts)
+rownames(counts) <- rownames_counts
+
+# Create Seurat object
+seurat_obj <- CreateSeuratObject(counts = counts)
+saveRDS(seurat_obj, "data/seuratObjRaw.RDS")
+rm(counts)
+
+# Load in metadata
+cell_metadata <- read.table("data/cells.txt", header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+sample_metadata <- read_excel("data/CRA001160.xlsx")
+
+# Add cell-level metadata
+seurat_obj$cell_type <- cell_metadata$cluster
+seurat_obj$orig.ident
+
+# Add sample-level metadata
+sample_metadata <- sample_metadata[match(seurat_obj$orig.ident, sample_metadata$`Sample name`), ]
+seurat_obj <- AddMetaData(seurat_obj, metadata = sample_metadata[, c("Sex", "Tissue")])
+seurat_obj$SampleType <- ifelse(grepl("^N", seurat_obj$orig.ident), "Normal", "Tumor")
+saveRDS(seurat_obj, "data/seuratObjMeta.RDS")
+```
+
+```{r Absolute cell count barplot by SampleType (Normal vs Tumor)}
+seurat_obj <- readRDS("data/seuratObjMeta.RDS")
+
+# Make sure the relevant metadata columns are present and correctly formatted
+seurat_obj$SampleType <- factor(seurat_obj$SampleType, levels = c("Normal", "Tumor"))
+seurat_obj$cell_type <- as.factor(seurat_obj$cell_type)
+
+# Create count table
+df <- as.data.frame(table(seurat_obj$cell_type, seurat_obj$SampleType))
+colnames(df) <- c("Cell_Type", "SampleType", "Count")
+
+# === Plot for Normal ===
+df_normal <- subset(df, SampleType == "Normal")
+p_normal <- ggplot(df_normal, aes(x = Cell_Type, y = Count, fill = Cell_Type)) +
+  geom_bar(stat = "identity") +
+  theme_classic() +
+  labs(
+    title = "Normal Samples",
+    y = "Cell Count",
+    x = "Cell Type"
+  ) + 
+  scale_fill_tableau("Tableau 10") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(face = "bold")
+  ) +
+  guides(fill = "none")  # Hide legend (optional)
+
+# === Plot for Tumor ===
+df_tumor <- subset(df, SampleType == "Tumor")
+p_tumor <- ggplot(df_tumor, aes(x = Cell_Type, y = Count, fill = Cell_Type)) +
+  geom_bar(stat = "identity") +
+  theme_classic() +
+  labs(
+    title = "Tumor Samples",
+    y = "Cell Count",
+    x = "Cell Type"
+  ) +
+  scale_fill_tableau("Tableau 10") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(face = "bold")
+  ) +
+  guides(fill = "none")  # Hide legend (optional)
+
+# Combine plots side by side
+p <- p_normal + p_tumor + plot_layout(ncol = 2)
+
+# Show and save
+print(p)
+
+ggsave(
+  p,
+  filename = "figures/allCells/allCells_barPlot_CellType_bySampleType.pdf",
+  width = 10,
+  height = 6
+)
+```
+
+
+# Start analysis
+
+```{r Cell number and percentage per assigned cell type}
+total_cells <- nrow(seurat_obj@meta.data)
+overviewCelltypes <- seurat_obj@meta.data %>%
+  group_by(cell_type, Sex) %>%
+  summarise(count = n()) %>%
+  spread(key = Sex, value = count, fill = 0) %>%
+  mutate(total = male + female,
+         male_percentage = (male / total_cells) * 100,
+         female_percentage = (female / total_cells) * 100, 
+         total_percentage = (total / total_cells) * 100) %>%
+  as.data.frame()
+
+write.csv(overviewCelltypes, "output/overviewCelltypes.csv", row.names = FALSE)
+```
+
+```{r Preprocess and dimension reduction}
+# Read in seurat object
+seurat_obj <- readRDS("data/seuratObjMeta.RDS")
+
+# Find variable features and scale data
+seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 5000, verbose = TRUE)
+seurat_obj <- ScaleData(seurat_obj, verbose = TRUE, vars.to.regress = NULL, layer = "counts")
+
+# Dimension reduction
+# Run PCA
+seurat_obj <- RunPCA(seurat_obj, verbose = TRUE, assay = "RNA")
+
+# Run UMAP on PCA
+seurat_fibro <- RunUMAP(seurat_fibro, dims = 1:15, reduction = "pca")
+
+# Save data
+saveRDS(seurat_obj, "data/seuratObjProcDimRed.RDS")
+```
+
+```{r dimPlot/featurePlots and heatmap all cells, message=FALSE, warning=FALSE}
+# Load data
+seurat_obj <- readRDS("data/seuratObjProcDimRed.RDS")
+
+# Reorder seurat$orig.ident
+sorted_vector <- c(
+  "N1", "N2", "N3", "N4", "N5", "N6", "N7", "N8", "N9", "N10", "N11",
+  "T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8", "T9", "T10", "T11", 
+  "T12", "T13", "T14", "T15", "T16", "T17", "T18", "T19", "T20", "T21", 
+  "T22", "T23", "T24"
+)
+
+seurat_obj$orig.ident <- factor(seurat_obj$orig.ident, levels = sorted_vector)
+
+# DimPlot Cell Type
+p <- DimPlot(object = seurat_obj, group.by = "cell_type", label = FALSE) + 
+  ggtitle("All cells, colored by cell type") +
+  theme(aspect.ratio = 1, axis.title.x = element_text(size = 12), 
+        axis.title.y = element_text(size = 12), 
+        axis.text = element_blank(), axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2") + scale_color_tableau("Tableau 10") +
+  labs(colour="Cell Type")
+p
+
+ggsave(p, filename = "figures/allCells/allCells_dimPlot_byCellType.pdf", width = 8, height = 8)
+
+# DimPlot Sample
+p <- DimPlot(object = seurat_obj, group.by = "orig.ident", label = FALSE) + 
+  ggtitle("All cells, colored by sample") +
+  theme(aspect.ratio = 1, axis.title.x = element_text(size = 12), 
+        axis.title.y = element_text(size = 12), 
+        axis.text = element_blank(), axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2") +   scale_color_manual(values = colorRampPalette(alphabet())(length(unique(seurat_obj$orig.ident)))) +
+  labs(colour="Sample ID")
+p
+
+ggsave(p, filename = "figures/allCells/allCells_dimPlot_bySample.pdf", width = 8, height = 8)
+
+
+# DimPlot Sample Split
+p <- DimPlot(object = seurat_obj, group.by = "orig.ident", label = FALSE, split.by = "SampleType") + 
+  ggtitle("All cells, colored by sample") +
+  theme(aspect.ratio = 1, axis.title.x = element_text(size = 12), 
+        axis.title.y = element_text(size = 12), 
+        axis.text = element_blank(), axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2") +   scale_color_manual(values = colorRampPalette(alphabet())(length(unique(seurat_obj$orig.ident)))) +
+  labs(colour="Sample ID")
+p
+
+ggsave(p, filename = "figures/allCells/allCells_dimPlot_bySampleSplit.pdf", width = 8, height = 8)
+
+# FeaturePlot established markers
+# Define the list of markers
+markers_list <- list(c(
+  "EPCAM", "CDH1", # epithelial cells
+  "PECAM1", "VWF", # endothelial cells
+  "PDGFRB", "FAP", # fibroblasts
+  "CD3", "CD4", "CD8", "NCR1", # T and NK cells
+  "CD14", "ITGAX", "HLA-DRA", # myeloid cells
+  "MS4A2", # mast cells and basophils
+  "MS4A1", # B cells
+  "IGKC", "IGHG1" # immunoglobulin-encoding genes for plasma cells
+))
+
+titles_list <- c("Established markers")  # Titles corresponding to the markers
+filenames_list <- c("byEstablishedmarkers")  # Corresponding filenames
+
+# Loop through the lists and generate both plots
+for (i in seq_along(markers_list)) {
+  
+  # Check if markers exist in the expression data or metadata
+  valid_markers <- markers_list[[i]][markers_list[[i]] %in% rownames(seurat_obj@assays$RNA@layers$scale.data)]
+  
+  if (length(valid_markers) == 0) {
+    message("No valid markers found for: ", paste(markers_list[[i]], collapse = ", "))
+    next  # Skip this iteration if no markers are valid
+  }
+  
+  feature_plot <- FeaturePlot(object = seurat_obj, features = valid_markers, 
+                              cols = c("lightgrey", "black"), ncol = 2)
+  
+  # Apply the theme to FeaturePlot
+  feature_plot <- lapply(feature_plot, function(plot) {
+    plot + theme(
+      aspect.ratio = 1,  # Ensure square aspect ratio for each plot
+      axis.title.x = element_text(size = 12),  # Customize axis title size
+      axis.title.y = element_text(size = 12),  # Customize axis title size
+      axis.text = element_blank(),  # Remove axis text
+      axis.ticks = element_blank()  # Remove axis ticks
+    ) +
+      labs(x = "UMAP1", y = "UMAP2")  # Add axis labels
+  })
+  
+  # Combine FeaturePlots
+  feature_plot <- wrap_plots(feature_plot, ncol = 5) + 
+    plot_annotation(
+      title = paste("FeaturePlot:", titles_list[i]),   # Change the title for each plot
+      theme = theme(
+        plot.title = element_text(size = 20, face = "bold", hjust = 0.5)  # Title style
+      )
+    )
+  print(feature_plot)
+  
+  # Save the FeaturePlot
+  ggsave(feature_plot, 
+         file = paste0("figures/allCells/allCells_featurePlot_", filenames_list[i], ".png"),
+         width = 20, height = 12)
+}
+
+# FeaturePlot estrogen biosynthesis
+# Read in gene set
+estrogenBiosyntesis_genes <- read_excel("data/Manoukian_Table S1.xls", sheet = "Estrogen_Biosynthesis", col_names = FALSE)[[1]][-1]
+
+gene_sets <- list(
+  estrogenBiosyntesis = estrogenBiosyntesis_genes
+)
+
+# Setting counts to dataslot
+seurat_obj[["RNA"]]$data <- seurat_obj[["RNA"]]$counts
+
+# Automated filtering, Z-score calculation, and plotting
+for (gene_set in names(gene_sets)) {
+  # Filter gene set to include only genes present in the Seurat object
+  filtered_genes <- gene_sets[[gene_set]][gene_sets[[gene_set]] %in% rownames(seurat_obj)]
+  
+  # Skip this gene set if no genes are found
+  if (length(filtered_genes) == 0) {
+    message(paste("No matching genes found for", gene_set, "- skipping."))
+    next
+  }
+  
+  # Add module score for the gene set
+  seurat_obj <- AddModuleScore(
+    seurat_obj, 
+    features = filtered_genes, 
+    name = paste0(gene_set, "_Score")
+  )
+  
+  # Extract the module score column name (Seurat appends '1' at the end)
+  module_score_col <- paste0(gene_set, "_Score1")
+
+  # Calculate Z-score for the module score across all cells
+  seurat_obj@meta.data[[paste0(gene_set, "_Zscore")]] <- (seurat_obj@meta.data[[module_score_col]] - mean(seurat_obj@meta.data[[module_score_col]])) / sd(seurat_obj@meta.data[[module_score_col]])
+
+  # Define the Z-score column for plotting
+  z_score_col <- paste0(gene_set, "_Zscore")
+  
+  # Plot Z-scores
+  p <- FeaturePlot_scCustom(
+    seurat_object = seurat_obj, 
+    features = z_score_col,
+    reduction = "umap",
+    na_cutoff = NA
+  ) + 
+    ggtitle(paste(gene_set, "Z-Score")) +
+    theme(
+      aspect.ratio = 1,
+      axis.title.x = element_text(size = 12),
+      axis.title.y = element_text(size = 12),
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    ) +
+    labs(x = "UMAP1", y = "UMAP2") + 
+    guides(color = guide_colorbar(), # Add a colorbar legend with title
+           labels = scales::number_format(accuracy = 0.1)) +  
+    theme(legend.title = element_text(face = "bold")) + 
+    scale_color_viridis()
+  # scale_color_gradient2(
+  #   low = "#0571b0",
+  #   mid = "white",
+  #   high = "#ca0020",
+  #   midpoint = 0  # White is mapped to 0
+  #   , limits = c(-2.5, 2.5) # optional if you want symmetrical limits
+  # )
+  
+  # Print plot
+  print(p)
+  
+  # Save plot
+  ggsave(
+    filename = file.path(paste0("figures/allCells/allCells_featurePlot_", gene_set, "_Zscore.pdf")),
+    plot = p,
+    width = 8,
+    height = 8
+  )
+}
+
+# Heatmap established markers
+# Define the genes of interest and their subset
+genes_of_interest <- markers_list[[1]]
+
+# Set the identity class based on the current resolution
+Idents(seurat_obj) <- seurat_obj$cell_type
+
+# Calculate the average expression for the genes of interest
+avg_expr <- AverageExpression(seurat_obj, features = genes_of_interest, return.seurat = TRUE, add.ident = "cell_type")
+Idents(avg_expr) <- avg_expr$cell_type
+
+# Plot the heatmap with normalized values
+p <- DoHeatmap(avg_expr, features = genes_of_interest, draw.lines = FALSE, slot = "scale.data") + 
+  NoLegend() + 
+  scale_fill_viridis() +
+  theme(plot.margin = margin(0, 1.5, 0, 0, unit = "cm")) # top, right, bottom, left
+
+p
+
+# Save the heatmap
+ggsave(p, filename = "figures/allCells/allCellsHeatmap_definedMarkerExpression_byCellType.pdf", width = 6, height = 10)
+```
+
+# Subset fibroblasts
+
+```{r Subset to fibroblast cells}
+# Subset data
+seurat_fibro <- subset(seurat_obj, subset = cell_type == "Fibroblast cell")
+
+# Save data
+saveRDS(seurat_fibro, "data/seuratFibroSubset.RDS")
+```
+
+# Processing and dimension reduction fibroblasts
+
+```{r Preprocessing fibroblasts, message=TRUE, warning=FALSE, paged.print=FALSE}
+# Read data
+seurat_fibro <- readRDS("data/seuratFibroSubset.RDS")
+
+# Preprocessing
+seurat_fibro <- seurat_fibro %>%
+  NormalizeData(normalization.method = "LogNormalize", verbose = TRUE) %>%
+  FindVariableFeatures(selection.method = "vst", nfeatures = 3000, verbose = TRUE) %>%
+  ScaleData(verbose = TRUE)
+```
+
+```{r Dimension reduction fibroblasts, paged.print=FALSE, message=FALSE}
+# Run PCA
+seurat_fibro <- RunPCA(seurat_fibro, verbose = TRUE, assay = "RNA")
+ElbowPlot(seurat_fibro)
+
+VizDimLoadings(object = seurat_fibro, dims = 1:2)
+
+DimHeatmap(object = seurat_fibro, dims = 1, cells = 500, balanced = TRUE)
+DimHeatmap(object = seurat_fibro, dims = 10:20, cells = 500, balanced = TRUE)
+
+# Run UMAP on PCA
+seurat_fibro <- RunUMAP(seurat_fibro, dims = 1:15, reduction = "pca")
+
+# Save data
+saveRDS(seurat_fibro, "data/seuratFibroProcDimRed.RDS")
+
+# Plot UMAP colored by samples
+p <- DimPlot(object = seurat_fibro, group.by = "orig.ident", label = FALSE) + 
+  ggtitle("Fibroblasts, colored by sample") +
+  theme(aspect.ratio = 1, axis.title.x = element_text(size = 12), 
+        axis.title.y = element_text(size = 12), 
+        axis.text = element_blank(), axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2") +   
+  scale_color_manual(values = colorRampPalette(alphabet())(length(unique(seurat_obj$orig.ident)))) +
+  labs(colour = "Sample ID")
+p
+
+# Save figure
+ggsave(p, "figures/fibroblasts/fibroblast_dimPlot_bySample_nonHarmonized.pdf", width = 8, height = 8)
+```
+
+```{r Harmony batch correction fibroblasts}
+# Run Harmony
+seurat_fibro <- RunHarmony(seurat_fibro, group.by.vars = "orig.ident", assay.use = "RNA", dims.use = 1:20)
+ElbowPlot(seurat_fibro, reduction = "harmony")
+VizDimLoadings(object = seurat_fibro, dims = 1:2)
+DimHeatmap(object = seurat_fibro, dims = 1, cells = 500, balanced = TRUE, reduction = "harmony")
+DimHeatmap(object = seurat_fibro, dims = 10:20, cells = 500, balanced = TRUE, reduction = "harmony")
+
+# Run UMAP on Harmony
+seurat_fibro <- RunUMAP(seurat_fibro, reduction = "harmony", dims = 1:15)
+
+# Save data
+saveRDS(seurat_fibro, "data/seuratFibroProcDimRedHarmonized.RDS")
+
+# Plot UMAP colored by samples
+p <- DimPlot(object = seurat_fibro, group.by = "orig.ident", label = FALSE, reduction = "harmony_umap") + 
+  ggtitle("Fibroblasts, colored by sample") +
+  theme(aspect.ratio = 1, axis.title.x = element_text(size = 12), 
+        axis.title.y = element_text(size = 12), 
+        axis.text = element_blank(), axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2") +   
+  scale_color_manual(values = colorRampPalette(alphabet())(length(unique(seurat_obj$orig.ident)))) +
+  labs(colour = "Sample ID")
+p
+
+# Save figure
+ggsave(p, "figures/fibroblasts/fibroblast_dimPlot_bySample.pdf", width = 8, height = 8)
+```
+
+# Further analysis fibroblasts 
+
+```{r featurePlots Z-score fibroblasts, warning=FALSE}
+# Read in data
+seurat_fibro <- readRDS(file="data/seuratFibroProcDimRedHarmonized.RDS")
+
+# Read in gene sets
+iCAF_genes <- read_excel("data/Gene lists.xlsx", sheet = "iCAF", col_names = FALSE)[[1]]
+myCAF_genes <- read_excel("data/Gene lists.xlsx", sheet = "myCAF", col_names = FALSE)[[1]]
+apCAF_genes <- read_excel("data/Gene lists.xlsx", sheet = "apCAF", col_names = FALSE)[[1]]
+iCAF.1_genes <- read_excel("data/Gene lists.xlsx", sheet = "iCAF.1", col_names = FALSE)[[1]]
+estrogenReceptor_genes <- read_excel("data/Gene lists.xlsx", sheet = "Estrogen receptor pathway", col_names = FALSE)[[2]][-1]
+cTypeLectin_genes <- read.csv("data/Ctype-lectins.csv", header = FALSE)$V1
+colECM_genes <- read_excel("data/Manoukian_Table S1.xls", sheet = "Collagen-containing ECM", col_names = FALSE)[[1]][-1]
+coreMatrisome_genes <- read_excel("data/Manoukian_Table S1.xls", sheet = "Core matrisome components", col_names = FALSE)[[1]][-1]
+
+gene_sets <- list(
+  iCAF = iCAF_genes,
+  myCAF = myCAF_genes,
+  apCAF = apCAF_genes,
+  iCAF.1 = iCAF.1_genes,
+  estrogenReceptor = estrogenReceptor_genes,
+  cTypeLectin = cTypeLectin_genes,
+  colECM = colECM_genes,
+  coreMatrisome = coreMatrisome_genes
+)
+
+# Automated filtering, Z-score calculation, and plotting
+for (gene_set in names(gene_sets)) {
+  # Filter gene set to include only genes present in the Seurat object
+  filtered_genes <- gene_sets[[gene_set]][gene_sets[[gene_set]] %in% rownames(seurat_fibro)]
+  
+  # Skip this gene set if no genes are found
+  if (length(filtered_genes) == 0) {
+    message(paste("No matching genes found for", gene_set, "- skipping."))
+    next
+  }
+  
+  # Add module score for the gene set
+  seurat_fibro <- AddModuleScore(
+    seurat_fibro, 
+    features = list(filtered_genes), 
+    name = paste0(gene_set, "_Score")
+  )
+  
+  # Extract the module score column name (Seurat appends '1' at the end)
+  module_score_col <- paste0(gene_set, "_Score1")
+
+  # Calculate Z-score for the module score across all cells
+  seurat_fibro@meta.data[[paste0(gene_set, "_Zscore")]] <- (seurat_fibro@meta.data[[module_score_col]] - mean(seurat_fibro@meta.data[[module_score_col]])) / sd(seurat_fibro@meta.data[[module_score_col]])
+
+  # Define the Z-score column for plotting
+  z_score_col <- paste0(gene_set, "_Zscore")
+  
+  # Plot Z-scores
+  p <- FeaturePlot_scCustom(
+    seurat_object = seurat_fibro, 
+    features = z_score_col,
+    reduction = "harmony_umap",
+    na_cutoff = NA
+  ) + 
+    ggtitle(paste(gene_set, "Z-Score")) +
+    theme(
+      aspect.ratio = 1,
+      axis.title.x = element_text(size = 12),
+      axis.title.y = element_text(size = 12),
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    ) +
+    labs(x = "UMAP1", y = "UMAP2") + 
+    guides(color = guide_colorbar(), # Add a colorbar legend with title
+           labels = scales::number_format(accuracy = 0.1)) +  
+    theme(legend.title = element_text(face = "bold")) + 
+  scale_color_gradient2(
+    low = "#0571b0",
+    mid = "white",
+    high = "#ca0020",
+    midpoint = 0  # White is mapped to 0
+    #, limits = c(-2.5, 2.5) # optional if you want symmetrical limits
+  )
+  
+  # Print plot
+  print(p)
+  
+  # Save plot
+  ggsave(
+    filename = file.path(paste0("figures/fibroblasts/fibroblast_featurePlot_by", gene_set, "_Zscore.pdf")),
+    plot = p,
+    width = 8,
+    height = 8
+  )
+}
+
+# Save seurat object with CAF gene signatures
+saveRDS(seurat_fibro, file="data/seuratFibroProcDimRedHarmonized_CAFsig.RDS")
+```
+```{r featurePlot genes of interest fibroblasts, warning=FALSE}
+# Define the genes of interest
+genes_of_interest <- c("OGN", "CLEC3B", "ESR1", "ESR2", "GPER1")
+genes_of_interest <- c("PDGFRA", "PDPN", "ENG", "THY1")
+
+# Check if all genes are present in the dataset
+genes_found <- genes_of_interest[genes_of_interest %in% rownames(seurat_fibro)]
+if (length(genes_found) < length(genes_of_interest)) {
+  missing_genes <- setdiff(genes_of_interest, genes_found)
+  message(paste("The following genes are not found in the dataset and will be skipped:", paste(missing_genes, collapse = ", ")))
+}
+
+# Plot FeaturePlots for each gene
+for (gene in genes_found) {
+  p <- FeaturePlot(
+    object = seurat_fibro, 
+    features = gene,
+    reduction = "harmony_umap",
+    cols = c("grey", "red")
+  ) + 
+    ggtitle(paste0(gene, " Expression")) +
+    theme(
+      aspect.ratio = 1,
+      axis.title.x = element_text(size = 12),
+      axis.title.y = element_text(size = 12),
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    ) +
+    labs(x = "UMAP1", y = "UMAP2") + 
+    guides(color = guide_colorbar(), 
+           labels = scales::number_format(accuracy = 0.1)) +  
+    theme(legend.title = element_text(face = "bold"))
+  
+  # Print plot
+  print(p)
+  
+  # Save plot
+  ggsave(
+    filename = file.path(paste0("figures/fibroblasts/fibroblastsubset_featurePlot_by", gene, ".pdf")),
+    plot = p,
+    width = 8,
+    height = 8
+  )
+}
+
+# Plot DensityPlots for each gene
+for (gene in genes_found) {
+  p <- plot_density(
+    object = seurat_fibro, 
+    features = gene,
+    reduction = "harmony_umap",
+    # cols = c("grey", "red")
+  ) + 
+    ggtitle(paste0(gene, " Expression")) +
+    theme(
+      aspect.ratio = 1,
+      axis.title.x = element_text(size = 12),
+      axis.title.y = element_text(size = 12),
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    ) +
+    labs(x = "UMAP1", y = "UMAP2") + 
+    guides(color = guide_colorbar(), 
+           labels = scales::number_format(accuracy = 0.1)) +  
+    theme(legend.title = element_text(face = "bold"))
+  
+  # Print plot
+  print(p)
+  
+  # Save plot
+  ggsave(
+    filename = file.path(paste0("figures/fibroblasts/fibroblastsubset_densityPlot_by", gene, ".pdf")),
+    plot = p,
+    width = 4,
+    height = 4
+  )
+}
+```
+
+
+```{r vlnPlot Z-scores split by sex, warning=FALSE, message=FALSE}
+#seurat_fibro <- readRDS(file="data/seuratFibroProcDimRedHarmonized_CAFsig.RDS")
+
+seurat_fibro$Sex <- as.factor(seurat_fibro$Sex)
+
+# Generate VlnPlot for Z-scores, split by Sex, with significance testing and mean difference
+for (gene_set in names(gene_sets)) {
+  # Define the Z-score column name
+  z_score_col <- paste0(gene_set, "_Zscore")
+  
+  # Check if Z-score column exists in metadata
+  if (!z_score_col %in% colnames(seurat_fibro[[]])) {
+    message(paste("Z-score", z_score_col, "not found for", gene_set, "- skipping."))
+    next
+  }
+  
+  # Define comparisons
+  my_comparisons <- list(c("female", "male"))
+  
+  # Calculate group means and their difference
+  female_mean <- mean(seurat_fibro[[]][seurat_fibro$Sex == "female", z_score_col], na.rm = TRUE)
+  male_mean <- mean(seurat_fibro[[]][seurat_fibro$Sex == "male", z_score_col], na.rm = TRUE)
+  mean_difference <- female_mean - male_mean
+  mean_label <- sprintf("Mean difference: %.2f (female - male)", mean_difference)
+  
+  # Generate the base VlnPlot
+  vln_plot <- VlnPlot(
+    object = seurat_fibro, 
+    features = z_score_col, 
+    group.by = "Sex", 
+    split.by = "Sex", 
+    pt.size = 0
+  )
+  
+  # Dynamically adjust the y-axis range
+  y_range <- ggplot_build(vln_plot)$layout$panel_params[[1]]$y.range
+  y_max <- max(y_range, na.rm = TRUE)
+  y_adjusted <- y_max + 0.15 * (y_max - min(y_range, na.rm = TRUE))  # Add 15% padding above the max value
+  
+  # Add geom_signif() for significance testing
+  p <- vln_plot +
+    ylim(c(min(y_range, na.rm = TRUE), y_adjusted)) +  # Extend y-axis range
+    geom_signif(test = "t.test", test.args = list(paired = FALSE),
+      comparisons = my_comparisons,
+      map_signif_level = function(p) sprintf("*p = %.2g", p),  # Format p-value
+      step_increase = 0.15  # Adjust step size for annotations
+    ) +
+    ggtitle(paste(gene_set, "Z-Score")) +
+    labs(fill = "Sex") +  # Add label for the Sex legend
+    theme(
+      axis.title.x = element_text(size = 12),
+      axis.title.y = element_text(size = 12),
+      legend.title = element_text(size = 12, face = "bold"),
+      legend.text = element_text(size = 10)
+    )
+  
+  # Create a separate text panel for the mean difference
+  text_plot <- ggplot() +
+    annotate("text", x = 0.5, y = 0.5, label = mean_label, size = 5, fontface = "italic", hjust = 0.5) +
+    theme_void()  # No axes or gridlines
+  
+  # Combine the plots using patchwork
+  final_plot <- p / text_plot + plot_layout(heights = c(4, 1))  # Give the violin plot more space
+  
+  # Print the combined plot
+  print(final_plot)
+  
+  # Save the combined plot
+  ggsave(
+    filename = paste0("figures/fibroblasts/fibroblast_VlnPlot_", gene_set, "_Zscore_bySex.pdf"),
+    plot = final_plot,
+    width = 8,
+    height = 8
+  )
+}
+```
+
+```{r vlnPlot Z-scores split by sex WITHOUT NORMAL, warning=FALSE, message=FALSE}
+#seurat_fibro <- readRDS(file="data/seuratFibroProcDimRedHarmonized_CAFsig.RDS")
+
+# Subset seurat_fibro to only contain tumor samples
+seurat_fibro@meta.data$orig.ident <- as.character(seurat_fibro@meta.data$orig.ident)
+cells_to_keep <- rownames(seurat_fibro@meta.data)[!grepl("^N", seurat_fibro@meta.data$orig.ident)]
+seurat_subsetfibro <- subset(seurat_fibro, cells = cells_to_keep)
+
+saveRDS(seurat_subsetfibro, "data/seuratFibroProcDimRedHarmonized_CAFsigSubset.RDS")
+
+seurat_subsetfibro$Sex <- as.factor(seurat_subsetfibro$Sex)
+
+# Generate VlnPlot for Z-scores, split by Sex, with significance testing and mean difference
+for (gene_set in names(gene_sets)) {
+  # Define the Z-score column name
+  z_score_col <- paste0(gene_set, "_Zscore")
+  
+  # Check if Z-score column exists in metadata
+  if (!z_score_col %in% colnames(seurat_subsetfibro[[]])) {
+    message(paste("Z-score", z_score_col, "not found for", gene_set, "- skipping."))
+    next
+  }
+  
+  # Define comparisons
+  my_comparisons <- list(c("female", "male"))
+  
+  # Calculate group means and their difference
+  female_mean <- mean(seurat_subsetfibro[[]][seurat_subsetfibro$Sex == "female", z_score_col], na.rm = TRUE)
+  male_mean <- mean(seurat_subsetfibro[[]][seurat_subsetfibro$Sex == "male", z_score_col], na.rm = TRUE)
+  mean_difference <- female_mean - male_mean
+  mean_label <- sprintf("Mean difference: %.2f (female - male)", mean_difference)
+  
+  # Generate the base VlnPlot
+  vln_plot <- VlnPlot(
+    object = seurat_subsetfibro, 
+    features = z_score_col, 
+    group.by = "Sex", 
+    split.by = "Sex", 
+    pt.size = 0
+  )
+  
+  # Dynamically adjust the y-axis range
+  y_range <- ggplot_build(vln_plot)$layout$panel_params[[1]]$y.range
+  y_max <- max(y_range, na.rm = TRUE)
+  y_adjusted <- y_max + 0.15 * (y_max - min(y_range, na.rm = TRUE))  # Add 15% padding above the max value
+  
+  # Add geom_signif() for significance testing
+  p <- vln_plot +
+    ylim(c(min(y_range, na.rm = TRUE), y_adjusted)) +  # Extend y-axis range
+    geom_signif(test = "t.test", test.args = list(paired = FALSE),
+      comparisons = my_comparisons,
+      map_signif_level = function(p) sprintf("*p = %.2g", p),  # Format p-value
+      step_increase = 0.15  # Adjust step size for annotations
+    ) +
+    ggtitle(paste(gene_set, "Z-Score")) +
+    labs(fill = "Sex") +  # Add label for the Sex legend
+    theme(
+      axis.title.x = element_text(size = 12),
+      axis.title.y = element_text(size = 12),
+      legend.title = element_text(size = 12, face = "bold"),
+      legend.text = element_text(size = 10)
+    )
+  
+  # Create a separate text panel for the mean difference
+  text_plot <- ggplot() +
+    annotate("text", x = 0.5, y = 0.5, label = mean_label, size = 5, fontface = "italic", hjust = 0.5) +
+    theme_void()  # No axes or gridlines
+  
+  # Combine the plots using patchwork
+  final_plot <- p / text_plot + plot_layout(heights = c(4, 1))  # Give the violin plot more space
+  
+  # Print the combined plot
+  print(final_plot)
+  
+  # Save the combined plot
+  ggsave(
+    filename = paste0("figures/fibroblasts/fibroblast_VlnPlot_", gene_set, "_Zscore_bySexWithoutNormal.pdf"),
+    plot = final_plot,
+    width = 8,
+    height = 8
+  )
+}
+```
+
+```{r vlnPlot Z-scores split by SampleType, warning=FALSE, message=FALSE}
+seurat_fibro$SampleType <- as.factor(seurat_fibro$SampleType)
+
+# Generate VlnPlot for Z-scores, split by SampleType, with significance testing and mean difference
+for (gene_set in names(gene_sets)) {
+  # Define the Z-score column name
+  z_score_col <- paste0(gene_set, "_Zscore")
+  
+  # Check if Z-score column exists in metadata
+  if (!z_score_col %in% colnames(seurat_fibro[[]])) {
+    message(paste("Z-score", z_score_col, "not found for", gene_set, "- skipping."))
+    next
+  }
+  
+  # Define comparisons
+  my_comparisons <- list(c("Normal", "Tumor"))
+  
+  # Calculate group means and their difference
+  Normal_mean <- mean(seurat_fibro[[]][seurat_fibro$SampleType == "Normal", z_score_col], na.rm = TRUE)
+  Tumor_mean <- mean(seurat_fibro[[]][seurat_fibro$SampleType == "Tumor", z_score_col], na.rm = TRUE)
+  mean_difference <- Normal_mean - Tumor_mean
+  mean_label <- sprintf("Mean difference: %.2f (Normal - Tumor)", mean_difference)
+  
+  # Generate the base VlnPlot
+  vln_plot <- VlnPlot(
+    object = seurat_fibro, 
+    features = z_score_col, 
+    group.by = "SampleType", 
+    split.by = "SampleType", 
+    pt.size = 0,
+    cols = c("Normal" = "#1f77b4", "Tumor" = "#ff7f0e")
+  )
+  
+  # Dynamically adjust the y-axis range
+  y_range <- ggplot_build(vln_plot)$layout$panel_params[[1]]$y.range
+  y_max <- max(y_range, na.rm = TRUE)
+  y_adjusted <- y_max + 0.15 * (y_max - min(y_range, na.rm = TRUE))  # Add 15% padding above the max value
+  
+  # Add geom_signif() for significance testing
+  p <- vln_plot +
+    ylim(c(min(y_range, na.rm = TRUE), y_adjusted)) +  # Extend y-axis range
+    geom_signif(test = "t.test", test.args = list(paired = FALSE),
+                comparisons = my_comparisons,
+                map_signif_level = function(p) sprintf("*p = %.2g", p),  # Format p-value
+                step_increase = 0.15) +
+    ggtitle(paste(gene_set, "Z-Score")) +
+    labs(fill = "SampleType") +
+    theme(
+      axis.title.x = element_text(size = 12),
+      axis.title.y = element_text(size = 12),
+      legend.title = element_text(size = 12, face = "bold"),
+      legend.text = element_text(size = 10)
+    )
+  
+  # Create a separate text panel for the mean difference
+  text_plot <- ggplot() +
+    annotate("text", x = 0.5, y = 0.5, label = mean_label, size = 5, fontface = "italic", hjust = 0.5) +
+    theme_void()
+  
+  # Combine the plots using patchwork
+  final_plot <- p / text_plot + plot_layout(heights = c(4, 1))
+  
+  # Print the combined plot
+  print(final_plot)
+  
+  # Save the combined plot
+  ggsave(
+    filename = paste0("figures/fibroblasts/fibroblast_VlnPlot_", gene_set, "_Zscore_bySampleType.pdf"),
+    plot = final_plot,
+    width = 8,
+    height = 8
+  )
+}
+```
+
+```{r vlnPlot genes split by sex}
+seurat_fibro$Sex <- as.factor(seurat_fibro$Sex)
+
+gene <- "OGN"  # Specify the gene of interest
+
+# Define comparisons
+my_comparisons <- list(c("female", "male"))
+
+# Calculate group means and their difference
+female_mean <- mean(FetchData(seurat_fibro, vars = gene)[seurat_fibro$Sex == "female", ], na.rm = TRUE)
+male_mean <- mean(FetchData(seurat_fibro, vars = gene)[seurat_fibro$Sex == "male", ], na.rm = TRUE)
+mean_difference <- female_mean - male_mean
+mean_label <- sprintf("Mean difference: %.2f (female - male)", mean_difference)
+
+# Generate the base VlnPlot
+vln_plot <- VlnPlot(
+  object = seurat_fibro, 
+  features = gene, 
+  group.by = "Sex", 
+  split.by = "Sex", 
+  pt.size = 0
+)
+
+# Dynamically adjust the y-axis range
+y_range <- ggplot_build(vln_plot)$layout$panel_params[[1]]$y.range
+y_max <- max(y_range, na.rm = TRUE)
+y_adjusted <- y_max + 0.15 * (y_max - min(y_range, na.rm = TRUE))  # Add 15% padding
+
+# Add geom_signif() for significance testing
+p <- vln_plot +
+  ylim(c(min(y_range, na.rm = TRUE), y_adjusted)) +  # Extend y-axis range
+  geom_signif(test = "wilcox.test",
+    comparisons = my_comparisons,
+    map_signif_level = function(p) sprintf("*p = %.2g", p),  # Format p-value
+    step_increase = 0.15  # Adjust step size for annotations
+  ) +
+  ggtitle(paste(gene, "Expression")) +
+  labs(fill = "Sex") +  # Add label for the Sex legend
+  theme(
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 10)
+  )
+
+# Create a separate text panel for the mean difference
+text_plot <- ggplot() +
+  annotate("text", x = 0.5, y = 0.5, label = mean_label, size = 5, fontface = "italic", hjust = 0.5) +
+  theme_void()  # No axes or gridlines
+
+# Combine the plots using patchwork
+final_plot <- p / text_plot + plot_layout(heights = c(4, 1))  # Give the violin plot more space
+
+# Print the combined plot
+print(final_plot)
+
+# Save the combined plot
+ggsave(
+  filename = "figures/fibroblasts/fibroblast_VlnPlot_OGN_bySex.pdf",
+  plot = final_plot,
+  width = 8,
+  height = 8
+)
+```
+
+```{r vlnPlot genes split by sex WITHOUT NORMAL}
+seurat_subsetfibro$Sex <- as.factor(seurat_subsetfibro$Sex)
+
+gene <- "OGN"  # Specify the gene of interest
+
+# Define comparisons
+my_comparisons <- list(c("female", "male"))
+
+# Calculate group means and their difference
+female_mean <- mean(FetchData(seurat_subsetfibro, vars = gene)[seurat_subsetfibro$Sex == "female", ], na.rm = TRUE)
+male_mean <- mean(FetchData(seurat_subsetfibro, vars = gene)[seurat_subsetfibro$Sex == "male", ], na.rm = TRUE)
+mean_difference <- female_mean - male_mean
+mean_label <- sprintf("Mean difference: %.2f (female - male)", mean_difference)
+
+# Generate the base VlnPlot
+vln_plot <- VlnPlot(
+  object = seurat_subsetfibro, 
+  features = gene, 
+  group.by = "Sex", 
+  split.by = "Sex", 
+  pt.size = 0
+)
+
+# Dynamically adjust the y-axis range
+y_range <- ggplot_build(vln_plot)$layout$panel_params[[1]]$y.range
+y_max <- max(y_range, na.rm = TRUE)
+y_adjusted <- y_max + 0.15 * (y_max - min(y_range, na.rm = TRUE))  # Add 15% padding
+
+# Add geom_signif() for significance testing
+p <- vln_plot +
+  ylim(c(min(y_range, na.rm = TRUE), y_adjusted)) +  # Extend y-axis range
+  geom_signif(test = "wilcox.test",
+    comparisons = my_comparisons,
+    map_signif_level = function(p) sprintf("*p = %.2g", p),  # Format p-value
+    step_increase = 0.15  # Adjust step size for annotations
+  ) +
+  ggtitle(paste(gene, "Expression")) +
+  labs(fill = "Sex") +  # Add label for the Sex legend
+  theme(
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 10)
+  )
+
+# Create a separate text panel for the mean difference
+text_plot <- ggplot() +
+  annotate("text", x = 0.5, y = 0.5, label = mean_label, size = 5, fontface = "italic", hjust = 0.5) +
+  theme_void()  # No axes or gridlines
+
+# Combine the plots using patchwork
+final_plot <- p / text_plot + plot_layout(heights = c(4, 1))  # Give the violin plot more space
+
+# Print the combined plot
+print(final_plot)
+
+# Save the combined plot
+ggsave(
+  filename = "figures/fibroblasts/fibroblast_VlnPlot_OGN_bySexWithoutNormal.pdf",
+  plot = final_plot,
+  width = 8,
+  height = 8
+)
+```
+
+```{r vlnPlot genes split by SampleType}
+seurat_fibro$SampleType <- as.factor(seurat_fibro$SampleType)
+
+gene <- "OGN"  # Specify the gene of interest
+
+# Define comparisons
+my_comparisons <- list(c("Normal", "Tumor"))
+
+# Calculate group means and their difference
+Normal_mean <- mean(FetchData(seurat_fibro, vars = gene)[seurat_fibro$SampleType == "Normal", ], na.rm = TRUE)
+Tumor_mean <- mean(FetchData(seurat_fibro, vars = gene)[seurat_fibro$SampleType == "Tumor", ], na.rm = TRUE)
+mean_difference <- Normal_mean - Tumor_mean
+mean_label <- sprintf("Mean difference: %.2f (Normal - Tumor)", mean_difference)
+
+# Generate the base VlnPlot
+vln_plot <- VlnPlot(
+  object = seurat_fibro, 
+  features = gene, 
+  group.by = "SampleType", 
+  split.by = "SampleType", 
+  pt.size = 0,
+  cols = c("Normal" = "#1f77b4", "Tumor" = "#ff7f0e")  # Example: blue for Normal, orange for Tumor
+)
+
+# Dynamically adjust the y-axis range
+y_range <- ggplot_build(vln_plot)$layout$panel_params[[1]]$y.range
+y_max <- max(y_range, na.rm = TRUE)
+y_adjusted <- y_max + 0.15 * (y_max - min(y_range, na.rm = TRUE))  # Add 15% padding
+
+# Add geom_signif() for significance testing
+p <- vln_plot +
+  ylim(c(min(y_range, na.rm = TRUE), y_adjusted)) +  # Extend y-axis range
+  geom_signif(test = "wilcox.test",
+    comparisons = my_comparisons,
+    map_signif_level = function(p) sprintf("*p = %.2g", p),  # Format p-value
+    step_increase = 0.15  # Adjust step size for annotations
+  ) +
+  ggtitle(paste(gene, "Expression")) +
+  labs(fill = "SampleType") +  # Add label for the Normal Tumor legend
+  theme(
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 10)
+  )
+
+# Create a separate text panel for the mean difference
+text_plot <- ggplot() +
+  annotate("text", x = 0.5, y = 0.5, label = mean_label, size = 5, fontface = "italic", hjust = 0.5) +
+  theme_void()  # No axes or gridlines
+
+# Combine the plots using patchwork
+final_plot <- p / text_plot + plot_layout(heights = c(4, 1))  # Give the violin plot more space
+
+# Print the combined plot
+print(final_plot)
+
+# Save the combined plot
+ggsave(
+  filename = "figures/fibroblasts/fibroblast_VlnPlot_OGN_bySampleType.pdf",
+  plot = final_plot,
+  width = 8,
+  height = 8
+)
+```
+
+```{r scatterPlot Estrogen vs CAF scores}
+# Extract the Z-scores from metadata and saving metadata
+meta_data <- as.data.frame(seurat_fibro@meta.data)
+write.csv(meta_data, "data/fibroblastMetadata.csv", row.names = FALSE)
+
+# List of Z-score columns to correlate against
+comparison_scores <- c("estrogenReceptor_Zscore", "colECM_Zscore", "coreMatrisome_Zscore")
+
+# CAF signatures to loop through
+CAF_signatures <- c("myCAF", "iCAF", "apCAF", "iCAF.1")
+
+# Loop through each CAF signature and each comparison signature
+for (caf in CAF_signatures) {
+  caf_column <- paste0(caf, "_Zscore")
+  
+  for (comp in comparison_scores) {
+    # Check if both columns exist in metadata
+    if (!all(c(comp, caf_column) %in% colnames(meta_data))) {
+      message(paste("Missing data for", caf, "vs", comp, "- skipping."))
+      next
+    }
+
+    # Correlation analysis
+    cor_test <- cor.test(
+      meta_data[[comp]],
+      meta_data[[caf_column]],
+      method = "pearson"
+    )
+
+    # Extract correlation results
+    r_value <- round(cor_test$estimate, 2)
+    p_value <- signif(cor_test$p.value, 3)
+
+    # Scatter plot with correlation annotation
+    p <- ggplot(meta_data, aes_string(x = caf_column, y = comp)) +
+      geom_point(alpha = 0.6) +
+      geom_smooth(method = "lm", se = FALSE, color = "red", linetype = "dashed") +
+      theme_classic() +
+      labs(
+        title = paste(comp, "vs", caf, "Z-score"),
+        subtitle = paste("Pearson r =", r_value, "p =", p_value),
+        y = comp,
+        x = paste(caf, "Z-score")
+      ) +
+      theme(
+        plot.title = element_text(size = 14, face = "bold"),
+        axis.title = element_text(size = 12),
+        aspect.ratio = 1
+      )
+
+    # Print the scatter plot
+    print(p)
+
+    # Save the plot
+    file_safe_comp <- gsub("_Zscore", "", comp)
+    filename <- paste0("figures/fibroblasts/fibroblast_ScatterPlot_", file_safe_comp, "_Zscore_vs_", caf, ".pdf")
+    ggsave(filename = filename, plot = p, width = 8, height = 8)
+
+    # Print to console
+    message(paste0(
+      "Correlation between ", comp, " and ", caf, ":\n",
+      "  Pearson's r = ", r_value, "\n",
+      "  p-value = ", p_value, "\n"
+    ))
+  }
+}
+```
+
+# Clustering
+
+```{r Clustering and clustree fibroblasts}
+seurat_fibro <- readRDS('data/seuratFibroProcDimRedHarmonized_CAFsig.RDS')
+
+# Perform clustering
+seurat_fibro <- seurat_fibro %>% 
+  FindNeighbors(dims = 1:15, reduction = "harmony") %>%
+  FindClusters(resolution = seq(from = 0.1, to = 1, by = 0.1), graph.name = "RNA_snn")
+
+# Save the updated Seurat object
+saveRDS(seurat_fibro, file = "data/seuratFibroProcDimRedHarmonized_CAFsig_Clustered.RDS")
+
+# Generate Clustree plot
+clustree_plot <- clustree(seurat_fibro, exprs = "scale.data")
+print(clustree_plot)
+
+# Save the Clustree plot
+ggsave(plot = clustree_plot, filename = "figures/fibroblasts/fibroblast_clustree.pdf", width = 10, height = 12)
+```
+
+```{r dimPlot clusters fibroblasts}
+# List of resolutions to iterate over
+resolutions <- c("0.1", "0.2", "0.4", "0.6", "0.8")
+
+# Loop through each resolution
+for (res in resolutions) {
+  # Extract UMAP coordinates and metadata dynamically for each resolution
+  umap_data <- as.data.frame(seurat_fibro@reductions$harmony_umap@cell.embeddings)
+  umap_data[[paste0("RNA_snn_res.", res)]] <- seurat_fibro@meta.data[[paste0("RNA_snn_res.", res)]]
+  
+  # Calculate the centroids for each cell type at the current resolution
+  centroid_data <- aggregate(cbind(harmonyumap_1, harmonyumap_2) ~ Cluster, 
+                             data = transform(umap_data, Cluster = umap_data[[paste0("RNA_snn_res.", res)]]), 
+                             FUN = mean)
+  
+  # Rename columns for easier plotting
+  colnames(centroid_data) <- c("Cluster", "UMAP_1", "UMAP_2")
+  
+  # Create UMAP plot without individual cell labels for the current resolution
+  p <- DimPlot(object = seurat_fibro, group.by = paste0("RNA_snn_res.", res), label = FALSE, reduction = "harmony_umap") + 
+    ggtitle(paste0("Fibroblast cells", ", colored by cluster - res ", res)) +
+    theme(aspect.ratio = 1, axis.title.x = element_text(size = 12), 
+          axis.title.y = element_text(size = 12), 
+          axis.text = element_blank(), axis.ticks = element_blank()) +
+    labs(x = "UMAP1", y = "UMAP2") + NoLegend()
+  
+  # Add non-overlapping text labels for cell type centroids
+  p <- p + geom_text_repel(data = centroid_data, aes(x = UMAP_1, y = UMAP_2, label = Cluster), size = 6)
+  print(p)
+  
+  # Save figure with dynamic file name
+  ggsave(p, file = paste0("figures/fibroblasts/fibroblastdimPlot_byClusterres", res, ".pdf"), width = 8, height = 8)
+}
+```
+
+``` {r DEG analysis and heatmap fibroblasts}
+# Define the vector of resolutions
+resolutions <- c(0.1)
+
+# Loop through each resolution to generate DEGs and save them
+for (res in resolutions) {
+  # Set the identity class based on the current resolution
+  ident_col <- paste0("RNA_snn_res.", res)
+  Idents(seurat_fibro) <- seurat_fibro[[ident_col]][, 1]
+  
+  # Parallelized marker finding
+  idents <- levels(Idents(seurat_fibro))
+  
+  markers_df <- FindAllMarkers(object = seurat_fibro, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, test.use="MAST")
+  
+  # Write the markers to a CSV file
+  write.csv(markers_df, file = paste0("output/fibroblasts/fibroblastmarkers_MAST_res", res, ".csv"), row.names = FALSE)
+  
+  # Get the top 10 markers per cluster and write to CSV
+  top10_markers <- markers_df %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+  write.csv(top10_markers, file = paste0("output/fibroblasts/fibroblastmarkers_MAST_res", res, "_top10.csv"), row.names = TRUE)
+}
+
+# Loop through each resolution to generate heatmaps from saved CSV files
+for (res in resolutions) {
+  # Set the identity class based on the current resolution
+  ident_col <- paste0("RNA_snn_res.", res)
+  Idents(seurat_fibro) <- seurat_fibro[[ident_col]][, 1]
+  
+  # Read the top 10 markers per cluster from the saved CSV
+  top10_markers <- read.csv(paste0("output/fibroblasts/fibroblastmarkers_MAST_res", res, "_top10.csv"))
+  
+  # Create the heatmap with normalized values
+  heatmap <- DoHeatmap(seurat_fibro, features = top10_markers$gene, slot = "scale.data") + 
+    NoLegend() + 
+    scale_fill_viridis() + 
+    theme(plot.margin = margin(1, 1, 0, 0, unit = "cm") # top, right, bottom, left
+  )
+  print(heatmap)
+  
+  # Save the heatmap
+  ggsave(heatmap, file = paste0("figures/fibroblasts/fibroblastHeatmap_topMarkerExpression_res", res, ".pdf"), width = 8, height = 12)
+}
+```
+
+```{r Annotating clusters fibroblasts}
+# Setting resolution to annotate
+Idents(seurat_fibro) <- seurat_fibro$RNA_snn_res.0.1
+
+# Create dataframe assigning clusters to annotation
+x <- c(0:3)
+y <-c("myCAF","iCAF","tCAF","iCAF")
+cluster_names <- as.data.frame(cbind(x,y))
+colnames(cluster_names) <-c("Cluster","CAF_type")
+
+# Assign metadata to seurat object
+cluster_ft <- cluster_names$CAF_type
+cluster_ft <-as.character(cluster_ft)
+names(cluster_ft) <- levels(seurat_fibro)
+seurat_fibro <- RenameIdents(seurat_fibro, cluster_ft)
+
+seurat_fibro[["CAF_type"]] <- Idents(seurat_fibro)
+
+# Save newly annotated seurat object
+saveRDS(seurat_fibro, file = "data/seuratFibroAnnotated.RDS")
+
+# Plot
+p <- DimPlot(object = seurat_fibro, group.by = "CAF_type", label = FALSE, reduction = "harmony_umap") + 
+  ggtitle("All cells, colored by sample") +
+  theme(aspect.ratio = 1, axis.title.x = element_text(size = 12), 
+        axis.title.y = element_text(size = 12), 
+        axis.text = element_blank(), axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2") + scale_color_tableau("Tableau 10") + labs(colour="CAF type")
+p
+
+# Save figure
+ggsave(p, file="figures/fibroblasts/fibroblast_dimPlot_byCAF_type.pdf", width=8, height=8)
+
+# Plot without tCAF
+seurat_fibro_wotCAF <- subset(seurat_fibro, CAF_type != "tCAF")
+p <- DimPlot(object = seurat_fibro_wotCAF, group.by = "CAF_type", label = FALSE, reduction = "harmony_umap") + 
+  ggtitle("All cells, colored by sample") +
+  theme(aspect.ratio = 1, axis.title.x = element_text(size = 12), 
+        axis.title.y = element_text(size = 12), 
+        axis.text = element_blank(), axis.ticks = element_blank()) +
+  labs(x = "UMAP1", y = "UMAP2") + scale_color_tableau("Tableau 10") + labs(colour="CAF type")
+p
+
+# Save figure
+ggsave(p, file="figures/fibroblasts/fibroblast_dimPlot_byCAF_type_without_tCAF.pdf", width=8, height=8)
+
+```
+
+```{r featurePlot genes of interest fibroblasts without tCAFs, warning=FALSE}
+# Read in gene sets
+iCAF_genes <- read_excel("data/Gene lists.xlsx", sheet = "iCAF", col_names = FALSE)[[1]]
+myCAF_genes <- read_excel("data/Gene lists.xlsx", sheet = "myCAF", col_names = FALSE)[[1]]
+apCAF_genes <- read_excel("data/Gene lists.xlsx", sheet = "apCAF", col_names = FALSE)[[1]]
+iCAF.1_genes <- read_excel("data/Gene lists.xlsx", sheet = "iCAF.1", col_names = FALSE)[[1]]
+estrogenReceptor_genes <- read_excel("data/Gene lists.xlsx", sheet = "Estrogen receptor pathway", col_names = FALSE)[[2]][-1]
+cTypeLectin_genes <- read.csv("data/Ctype-lectins.csv", header = FALSE)$V1
+colECM_genes <- read_excel("data/Manoukian_Table S1.xls", sheet = "Collagen-containing ECM", col_names = FALSE)[[1]][-1]
+coreMatrisome_genes <- read_excel("data/Manoukian_Table S1.xls", sheet = "Core matrisome components", col_names = FALSE)[[1]][-1]
+
+activatedStroma_genes <- read_excel("data/Moffitt PDAC signatures.xlsx", sheet = "Activated PDAC_Moffit")[[1]]
+normalStroma_genes <- read_excel("data/Moffitt PDAC signatures.xlsx", sheet = "Normal PDAC_Moffit")[[1]]
+
+gene_sets <- list(
+  iCAF = iCAF_genes,
+  myCAF = myCAF_genes,
+  apCAF = apCAF_genes,
+  iCAF.1 = iCAF.1_genes,
+  estrogenReceptor = estrogenReceptor_genes,
+  cTypeLectin = cTypeLectin_genes,
+  colECM = colECM_genes,
+  coreMatrisome = coreMatrisome_genes,
+  activatedStroma = activatedStroma_genes,
+  normalStroma = normalStroma_genes
+)
+
+# Automated filtering, Z-score calculation, and plotting
+for (gene_set in names(gene_sets)) {
+  # Filter gene set to include only genes present in the Seurat object
+  filtered_genes <- gene_sets[[gene_set]][gene_sets[[gene_set]] %in% rownames(seurat_fibro)]
+  
+  # Skip this gene set if no genes are found
+  if (length(filtered_genes) == 0) {
+    message(paste("No matching genes found for", gene_set, "- skipping."))
+    next
+  }
+  
+  # Add module score for the gene set
+  seurat_fibro <- AddModuleScore(
+    seurat_fibro, 
+    features = list(filtered_genes), 
+    name = paste0(gene_set, "_Score")
+  )
+  
+  # Extract the module score column name (Seurat appends '1' at the end)
+  module_score_col <- paste0(gene_set, "_Score1")
+
+  # Calculate Z-score for the module score across all cells
+  seurat_fibro@meta.data[[paste0(gene_set, "_Zscore")]] <- (seurat_fibro@meta.data[[module_score_col]] - mean(seurat_fibro@meta.data[[module_score_col]])) / sd(seurat_fibro@meta.data[[module_score_col]])
+
+  # Define the Z-score column for plotting
+  z_score_col <- paste0(gene_set, "_Zscore")
+  
+  # Plot Z-scores
+  p <- FeaturePlot_scCustom(
+    seurat_object = seurat_fibro_wotCAF, 
+    features = z_score_col,
+    reduction = "harmony_umap",
+    na_cutoff = NA
+  ) + 
+    ggtitle(paste(gene_set, "Z-Score")) +
+    theme(
+      aspect.ratio = 1,
+      axis.title.x = element_text(size = 12),
+      axis.title.y = element_text(size = 12),
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    ) +
+    labs(x = "UMAP1", y = "UMAP2") + 
+    guides(color = guide_colorbar(), # Add a colorbar legend with title
+           labels = scales::number_format(accuracy = 0.1)) +  
+    theme(legend.title = element_text(face = "bold")) + 
+  scale_color_gradient2(
+    low = "#0571b0",
+    mid = "white",
+    high = "#ca0020",
+    midpoint = 0  # White is mapped to 0
+    #, limits = c(-2.5, 2.5) # optional if you want symmetrical limits
+  )
+  
+  # Print plot
+  print(p)
+  
+  # # Save plot
+  # ggsave(
+  #   filename = file.path(paste0("figures/fibroblasts/fibroblast_featurePlot_by", gene_set, "_Zscore_without_tCAF.pdf")),
+  #   plot = p,
+  #   width = 8,
+  #   height = 8
+  # )
+}
+```
+
+```{r vlnPlot Z-scores split by CAF type fibroblasts}
+# Read in data
+seurat_fibro <- readRDS("data/seuratSubsetFibroAnnotated.RDS")
+seurat_fibro$CAF_type
+
+# Read in gene sets
+estrogenReceptor_genes <- read_excel("data/Gene lists.xlsx", sheet = "Estrogen receptor pathway", col_names = FALSE)[[2]][-1]
+cTypeLectin_genes <- read.csv("data/Ctype-lectins.csv", header = FALSE)$V1
+colECM_genes <- read_excel("data/Manoukian_Table S1.xls", sheet = "Collagen-containing ECM", col_names = FALSE)[[1]][-1]
+coreMatrisome_genes <- read_excel("data/Manoukian_Table S1.xls", sheet = "Core matrisome components", col_names = FALSE)[[1]][-1]
+activatedStroma_genes <- read_excel("data/Moffitt PDAC signatures.xlsx", sheet = "Activated PDAC_Moffit")[[1]]
+normalStroma_genes <- read_excel("data/Moffitt PDAC signatures.xlsx", sheet = "Normal PDAC_Moffit")[[1]]
+
+gene_sets <- list(
+  estrogenReceptor = estrogenReceptor_genes,
+  cTypeLectin = cTypeLectin_genes,
+  colECM = colECM_genes,
+  coreMatrisome = coreMatrisome_genes, 
+  activatedStroma = activatedStroma_genes,
+  normalStroma = normalStroma_genes
+)
+
+# Generate VlnPlot for Z-scores, split by CAF Type, with significance testing and mean differences
+for (gene_set in names(gene_sets)) {
+  # Define the Z-score column name
+  z_score_col <- paste0(gene_set, "_Zscore")
+  
+  # Check if Z-score column exists in metadata
+  if (!z_score_col %in% colnames(seurat_fibro[[]])) {
+    message(paste("Z-score", z_score_col, "not found for", gene_set, "- skipping."))
+    next
+  }
+  
+  # Define all possible pairwise comparisons for CAF_type
+  caf_levels <- levels(seurat_fibro$CAF_type)
+  my_comparisons <- combn(caf_levels, 2, simplify = FALSE)
+  
+  # Extract Z-score data
+  gene_data <- data.frame(
+  Zscore = as.numeric(seurat_fibro@meta.data[[z_score_col]]),
+  CAF_type = seurat_fibro$CAF_type
+)
+
+  # Calculate mean values for each CAF type
+  mean_values <- tapply(gene_data$Zscore, seurat_fibro$CAF_type, mean, na.rm = TRUE)
+
+  # Convert mean values into a formatted string for annotation
+  mean_label <- paste(
+    sprintf("%s: %.2f", names(mean_values), mean_values),
+    collapse = ", "  # New line for each group
+  )
+
+  # Create the label for mean values
+  mean_label <- sprintf("Mean values:\n%s", mean_label)
+
+  # Generate the base VlnPlot
+  vln_plot <- VlnPlot(
+    object = seurat_fibro, 
+    features = z_score_col, 
+    group.by = "CAF_type", 
+    pt.size = 0
+  )
+  
+  # Dynamically adjust the y-axis range
+  y_range <- ggplot_build(vln_plot)$layout$panel_params[[1]]$y.range
+  y_max <- max(y_range, na.rm = TRUE)
+  y_adjusted <- y_max + 0.35 * (y_max - min(y_range, na.rm = TRUE))  # Add 35% padding above the max value
+  
+  # Add geom_signif() for pairwise comparisons
+  p <- vln_plot +
+    ylim(c(min(y_range, na.rm = TRUE), y_adjusted)) +  # Extend y-axis range
+    geom_signif(test = "t.test",
+      comparisons = my_comparisons,
+      map_signif_level = function(p) sprintf("*p = %.2g", p),  # Format p-value
+      step_increase = 0.15  # Adjust step size for annotations
+    ) +
+    ggtitle(paste(gene_set, "Z-Score by CAF Type")) +
+    labs(fill = "CAF Type") +  # Add label for the CAF Type legend
+    theme(
+      axis.title.x = element_text(size = 12),
+      axis.title.y = element_text(size = 12),
+      legend.title = element_text(size = 12, face = "bold"),
+      legend.text = element_text(size = 10)
+    )
+  
+  # Create a separate text panel for the mean differences
+  text_plot <- ggplot() +
+    annotate("text", x = 0.5, y = 0.5, label = mean_label, size = 5, fontface = "italic", hjust = 0.5) +
+    theme_void()  # No axes or gridlines
+  
+  # Combine the plots using patchwork
+  final_plot <- p / text_plot + plot_layout(heights = c(4, 1))  # Give the violin plot more space
+  
+  # Print the combined plot
+  print(final_plot)
+  
+  # Save the combined plot
+  ggsave(
+    filename = paste0("figures/fibroblasts/fibroblast_VlnPlot_", gene_set, "_Zscore_byCAFtype.pdf"),
+    plot = final_plot,
+    width = 8,
+    height = 8
+  )
+}
+
+# Subset fibro to only contain iCAF and myCAF subsets
+seurat_subsetfibro <- subset(seurat_fibro, CAF_type == "iCAF" | CAF_type == "myCAF")
+seurat_subsetfibro$CAF_type <- factor(seurat_subsetfibro$CAF_type, levels = c("myCAF", "iCAF"))
+
+# Save object and metadata
+saveRDS(seurat_subsetfibro, file = "data/seuratSubsetFibroAnnotated.RDS")
+subset_meta_data <- seurat_subsetfibro@meta.data
+write.csv(subset_meta_data, "data/fibroblastSubsetMetadata.csv")
+
+# Generate VlnPlot for Z-scores, split by CAF Type, with significance testing and mean differences
+for (gene_set in names(gene_sets)) {
+  # Define the Z-score column name
+  z_score_col <- paste0(gene_set, "_Zscore")
+  
+  # Check if Z-score column exists in metadata
+  if (!z_score_col %in% colnames(seurat_subsetfibro[[]])) {
+    message(paste("Z-score", z_score_col, "not found for", gene_set, "- skipping."))
+    next
+  }
+  
+  # Define all possible pairwise comparisons for CAF_type
+  caf_levels <- levels(seurat_subsetfibro$CAF_type)
+  my_comparisons <- combn(caf_levels, 2, simplify = FALSE)
+  
+  # Extract Z-score data
+  gene_data <- data.frame(
+  Zscore = as.numeric(seurat_subsetfibro@meta.data[[z_score_col]]),
+  CAF_type = seurat_subsetfibro$CAF_type
+)
+
+  # Calculate mean values for each CAF type
+  mean_values <- tapply(gene_data$Zscore, seurat_subsetfibro$CAF_type, mean, na.rm = TRUE)
+
+  # Convert mean values into a formatted string for annotation
+  mean_label <- paste(
+    sprintf("%s: %.2f", names(mean_values), mean_values),
+    collapse = ", "  # New line for each group
+  )
+
+  # Create the label for mean values
+  mean_label <- sprintf("Mean values:\n%s", mean_label)
+
+  # Generate the base VlnPlot
+  vln_plot <- VlnPlot(
+    object = seurat_subsetfibro, 
+    features = z_score_col, 
+    group.by = "CAF_type", 
+    pt.size = 0
+  )
+  
+  # Dynamically adjust the y-axis range
+  y_range <- ggplot_build(vln_plot)$layout$panel_params[[1]]$y.range
+  y_max <- max(y_range, na.rm = TRUE)
+  y_adjusted <- y_max + 0.35 * (y_max - min(y_range, na.rm = TRUE))  # Add 35% padding above the max value
+  
+  # Add geom_signif() for pairwise comparisons
+  p <- vln_plot +
+    ylim(c(min(y_range, na.rm = TRUE), y_adjusted)) +  # Extend y-axis range
+    geom_signif(test = "t.test",
+      comparisons = my_comparisons,
+      map_signif_level = function(p) sprintf("*p = %.2g", p),  # Format p-value
+      step_increase = 0.15  # Adjust step size for annotations
+    ) +
+    ggtitle(paste(gene_set, "Z-Score by CAF Type")) +
+    labs(fill = "CAF Type") +  # Add label for the CAF Type legend
+    theme(
+      axis.title.x = element_text(size = 12),
+      axis.title.y = element_text(size = 12),
+      legend.title = element_text(size = 12, face = "bold"),
+      legend.text = element_text(size = 10)
+    )
+  
+  # Create a separate text panel for the mean differences
+  text_plot <- ggplot() +
+    annotate("text", x = 0.5, y = 0.5, label = mean_label, size = 5, fontface = "italic", hjust = 0.5) +
+    theme_void()  # No axes or gridlines
+  
+  # Combine the plots using patchwork
+  final_plot <- p / text_plot + plot_layout(heights = c(4, 1))  # Give the violin plot more space
+  
+  # Print the combined plot
+  print(final_plot)
+  
+  # Save the combined plot
+  ggsave(
+    filename = paste0("figures/fibroblasts/fibroblastsubset_VlnPlot_", gene_set, "_Zscore_byCAFtype.pdf"),
+    plot = final_plot,
+    width = 8,
+    height = 8
+  )
+}
+```
+
+```{r Failed attempt at running ANOVA}
+# # Read in data
+# seurat_fibro <- readRDS("data/seuratFibroAnnotated.RDS")
+# 
+# # Read in gene sets
+# estrogenReceptor_genes <- read_excel("data/Gene lists.xlsx", sheet = "Estrogen receptor pathway", col_names = FALSE)[[2]][-1]
+# cTypeLectin_genes <- read.csv("data/Ctype-lectins.csv", header = FALSE)$V1
+# 
+# gene_sets <- list(
+#   estrogenReceptor = estrogenReceptor_genes,
+#   cTypeLectin = cTypeLectin_genes
+# )
+# 
+# # Ensure CAF_type is a factor
+# seurat_fibro$CAF_type <- as.factor(seurat_fibro$CAF_type)
+# 
+# # Loop over gene sets and create violin plots
+# for (gene_set in names(gene_sets)) {
+#   
+#   # Define the Z-score column name
+#   z_score_col <- paste0(gene_set, "_Zscore")
+#   
+#   # Check if Z-score column exists in metadata
+#   if (!z_score_col %in% colnames(seurat_fibro@meta.data)) {
+#     message(paste("Z-score", z_score_col, "not found for", gene_set, "- skipping."))
+#     next
+#   }
+#   
+#   # Extract Z-score data
+#   gene_data <- data.frame(
+#   Zscore = as.numeric(seurat_fibro@meta.data[[z_score_col]]), 
+#   CAF_type = seurat_fibro$CAF_type
+# )
+# 
+#   # Calculate mean values for each CAF type
+#   mean_values <- tapply(gene_data$Zscore, seurat_fibro$CAF_type, mean, na.rm = TRUE)
+#   
+#   # Convert mean values into a formatted string for annotation
+#   mean_label <- paste(
+#     sprintf("%s: %.2f", names(mean_values), mean_values),
+#     collapse = ", "  # New line for each group
+#   )
+#   
+#   # Create the label for mean values
+#   mean_label <- sprintf("Mean values:\n%s", mean_label)
+# 
+#   # Run Welch's ANOVA
+#   welch_result <- oneway.test(Zscore ~ CAF_type, data = gene_data)
+#   
+#   # Extract Welch's ANOVA p-value
+#   anova_p_value <- welch_result$p.value
+#   
+#   # Format Welch's ANOVA p-value for subtitle
+#   anova_label <- sprintf("Welch's ANOVA: p = %.2g", anova_p_value)
+#   
+#   # Run Tukey’s HSD post-hoc test
+#   tukey_results <- TukeyHSD(aov_model, "CAF_type")
+#   
+#   # Convert Tukey results into a dataframe
+#   tukey_df <- as.data.frame(tukey_results$CAF_type)
+#   tukey_df$Comparison <- rownames(tukey_results$CAF_type)  # Store pair names
+#   
+#   # Extract adjusted p-values and format them
+#   tukey_pvalues <- tukey_df$`p adj`
+#   
+#   # Extract row names and split them into a list of character vectors
+#   tukey_comparisons <- lapply(rownames(tukey_df), function(x) unlist(strsplit(x, "-")))
+#   
+#   # Format p-values for geom_signif() annotations
+#   tukey_annotations <- sprintf("p = %.2g", tukey_pvalues)
+#   
+#   # Determine Y-axis limits dynamically
+#   y_min <- min(gene_data$Zscore, na.rm = TRUE)
+#   y_max <- max(gene_data$Zscore, na.rm = TRUE)
+#   y_adjusted <- y_max + 0.45 * (y_max - y_min)  # Add 45% padding for significance bars
+#   
+#   valid_comparisons <- tukey_comparisons[sapply(tukey_comparisons, function(pair) all(pair %in% unique(gene_data$CAF_type)))]
+#   valid_annotations <- tukey_annotations[sapply(tukey_comparisons, function(pair) all(pair %in% unique(gene_data$CAF_type)))]
+#   
+#   p <- VlnPlot(
+#     object = seurat_fibro, 
+#     features = z_score_col, 
+#     group.by = "CAF_type", 
+#     pt.size = 0
+#   ) +
+#     ylim(y_min, y_adjusted) +  # Fix Y-axis scaling
+#     # stat_compare_means(method = "anova", label = NULL) +  
+#     geom_signif(
+#       comparisons = valid_comparisons,
+#       annotations = valid_annotations,
+#       step_increase = 0.15
+#     ) +
+#     ggtitle(paste(gene_set, "Z-Score by CAF Type"),
+#             subtitle = anova_label  # **ANOVA p-value in subtitle**
+#     ) +
+#     labs(fill = "CAF Type") +  # Add label for the CAF Type legend
+#     theme(
+#       axis.title.x = element_text(size = 12),
+#       axis.title.y = element_text(size = 12),
+#       legend.title = element_text(size = 12, face = "bold"),
+#       legend.text = element_text(size = 10)
+#     )
+#   
+#   # Create a separate text panel for the mean differences
+#   text_plot <- ggplot() +
+#     annotate("text", x = 0.5, y = 0.5, label = mean_label, size = 5, fontface = "italic", hjust = 0.5) +
+#     theme_void()  # No axes or gridlines
+#   
+#   # Combine the plots using patchwork
+#   final_plot <- p / text_plot + plot_layout(heights = c(4, 1))  # Give the violin plot more space
+#   
+#   # Print the combined plot
+#   print(final_plot)
+#   
+#   # Save the combined plot
+#   ggsave(
+#     filename = paste0("figures/fibroblasts/fibroblast_VlnPlot_", gene_set, "_Zscore_byCAFtype.pdf"),
+#     plot = final_plot,
+#     width = 8,
+#     height = 8
+#   )
+# }
+```
+
+```{r vlnPlot genes split by CAF type}
+# Define genes of interest
+genes_of_interest <- c("OGN", "CLEC3B", "ESR1", "ESR2", "GPER1", "PDGFRA", "PDPN", "ENG", "THY1")
+
+# Ensure CAF_type is a factor
+seurat_fibro$CAF_type <- as.factor(seurat_fibro$CAF_type)
+
+# Create all possible pairwise comparisons for CAF_type
+caf_levels <- levels(seurat_fibro$CAF_type)
+my_comparisons <- combn(caf_levels, 2, simplify = FALSE)
+
+# Loop over genes and create violin plots
+plot_list <- list()
+
+for (gene in genes_of_interest) {
+  
+  # Fetch gene expression data
+  gene_data <- FetchData(seurat_fibro, vars = gene)
+  gene_data$CAF_type <- seurat_fibro$CAF_type  # Add CAF type to data
+ 
+  # Calculate mean per CAF type
+  mean_values <- tapply(gene_data[[gene]], gene_data$CAF_type, mean, na.rm = TRUE)
+  mean_text <- paste(
+    sprintf("%s: %.2f", names(mean_values), mean_values), 
+    collapse = ", "
+  )
+  mean_label <- sprintf("Mean values:\n%s", mean_text)
+   
+  # Generate the base VlnPlot
+  vln_plot <- VlnPlot(
+    object = seurat_fibro, 
+    features = gene, 
+    group.by = "CAF_type", 
+    pt.size = 0
+  )
+  
+  # Dynamically adjust the y-axis range
+  y_range <- ggplot_build(vln_plot)$layout$panel_params[[1]]$y.range
+  y_max <- max(y_range, na.rm = TRUE)
+  y_adjusted <- y_max + 0.2 * (y_max - min(y_range, na.rm = TRUE))  # Add 15% padding
+  
+  # Add geom_signif() for pairwise comparisons
+  p <- vln_plot +
+    ylim(c(min(y_range, na.rm = TRUE), y_adjusted)) +  # Extend y-axis range
+    geom_signif(test = "wilcox.test", comparisons = my_comparisons,
+      map_signif_level = function(p) sprintf("*p = %.2g", p),  # Format p-value
+      step_increase = 0.10  # Adjust step size for annotations
+    ) +
+    ggtitle(paste(gene, "Expression by CAF Type")) +
+    labs(fill = "CAF Type") +  # Add label for the CAF Type legend
+    theme(
+      axis.title.x = element_text(size = 12),
+      axis.title.y = element_text(size = 12),
+      legend.title = element_text(size = 12, face = "bold"),
+      legend.text = element_text(size = 10)
+    )
+  
+  # Create a separate text panel for the mean differences
+  text_plot <- ggplot() +
+    annotate("text", x = 0.5, y = 0.5, label = mean_label, size = 5, fontface = "italic", hjust = 0.5) +
+    theme_void()  # No axes or gridlines
+  
+  # Combine the plots using patchwork
+  final_plot <- p / text_plot + plot_layout(heights = c(4, 1))  # Give the violin plot more space
+  
+  # Save each plot to a file
+  ggsave(
+    filename = sprintf("figures/fibroblasts/fibroblast_VlnPlot_%s_byCAFtype.pdf", gene),
+    plot = final_plot,
+    width = 8,
+    height = 8
+  )
+  
+  # Add the final plot to the list
+  plot_list[[gene]] <- final_plot
+}
+
+# Now for subset seurat_fibro
+caf_levels <- levels(seurat_subsetfibro$CAF_type)
+my_comparisons <- combn(caf_levels, 2, simplify = FALSE)
+
+for (gene in genes_of_interest) {
+  
+  # Fetch gene expression data
+  gene_data <- FetchData(seurat_subsetfibro, vars = gene)
+  gene_data$CAF_type <- seurat_subsetfibro$CAF_type  # Add CAF type to data
+ 
+  # Calculate mean per CAF type
+  mean_values <- tapply(gene_data[[gene]], gene_data$CAF_type, mean, na.rm = TRUE)
+  mean_text <- paste(
+    sprintf("%s: %.2f", names(mean_values), mean_values), 
+    collapse = ", "
+  )
+  mean_label <- sprintf("Mean values:\n%s", mean_text)
+   
+  # Generate the base VlnPlot
+  vln_plot <- VlnPlot(
+    object = seurat_subsetfibro, 
+    features = gene, 
+    group.by = "CAF_type", 
+    pt.size = 0
+  )
+  
+  # Dynamically adjust the y-axis range
+  y_range <- ggplot_build(vln_plot)$layout$panel_params[[1]]$y.range
+  y_max <- max(y_range, na.rm = TRUE)
+  y_adjusted <- y_max + 0.2 * (y_max - min(y_range, na.rm = TRUE))  # Add 15% padding
+  
+  # Add geom_signif() for pairwise comparisons
+  p <- vln_plot +
+    ylim(c(min(y_range, na.rm = TRUE), y_adjusted)) +  # Extend y-axis range
+    geom_signif(test = "wilcox.test", comparisons = my_comparisons,
+      map_signif_level = function(p) sprintf("*p = %.2g", p),  # Format p-value
+      step_increase = 0.10  # Adjust step size for annotations
+    ) +
+    ggtitle(paste(gene, "Expression by CAF Type")) +
+    labs(fill = "CAF Type") +  # Add label for the CAF Type legend
+    theme(
+      axis.title.x = element_text(size = 12),
+      axis.title.y = element_text(size = 12),
+      legend.title = element_text(size = 12, face = "bold"),
+      legend.text = element_text(size = 10)
+    )
+  
+  # Create a separate text panel for the mean differences
+  text_plot <- ggplot() +
+    annotate("text", x = 0.5, y = 0.5, label = mean_label, size = 5, fontface = "italic", hjust = 0.5) +
+    theme_void()  # No axes or gridlines
+  
+  # Combine the plots using patchwork
+  final_plot <- p / text_plot + plot_layout(heights = c(4, 1))  # Give the violin plot more space
+  
+  # Save each plot to a file
+  ggsave(
+    filename = sprintf("figures/fibroblasts/fibroblastsubset_VlnPlot_%s_byCAFtype.pdf", gene),
+    plot = final_plot,
+    width = 8,
+    height = 8
+  )
+  
+  # Add the final plot to the list
+  plot_list[[gene]] <- final_plot
+}
+```
+
+```{r Circle plot/stacked barchart}
+seurat_fibro <- readRDS("data/seuratFibroAnnotated.RDS")
+
+# Create df
+df <- as.data.frame(seurat_fibro@meta.data)  # Ensure it's a dataframe
+df$Sex <- as.factor(df$Sex)  # Convert Sex to factor
+df$CAF_type <- as.factor(df$CAF_type)  # Convert CAF_type to factor
+df <- as.data.frame(table(df$Sex, df$CAF_type))
+colnames(df) <- c("Sex", "CAF_type", "Count")
+df <- df %>%
+  group_by(Sex) %>%
+  mutate(Proportion = Count / sum(Count)) %>%
+  ungroup()
+
+# Perform Chi-Square Test
+chi_test <- chisq.test(xtabs(Count ~ Sex + CAF_type, data = df))
+
+# Extract p-value and test statistic
+chi_subtitle <- paste0("Chi-Square Test: Chi² = ", round(chi_test$statistic, 2), 
+                       ", p = ", signif(chi_test$p.value, 3))
+
+# Barchart
+p <- ggplot(df, aes(x = Sex, y = Count, fill = CAF_type)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  theme_classic() +
+  labs(
+    y = "Proportion",
+    x = "Sex",
+    fill = "CAF Type",
+    title = "CAF Type Proportions by Sex",
+    subtitle = chi_subtitle
+  ) 
+p
+
+ggsave(p, filename = "figures/fibroblasts/fibroblast_BarPlot_CAFtype_bySex.pdf", width = 8, height = 8)
+
+# Piechart
+p <- ggplot(df, aes(x = "", y = Proportion, fill = CAF_type)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y") +
+  facet_wrap(~Sex) +
+  theme_void() +
+  labs(title = "CAF Type Distribution by Sex", fill = "CAF Type", subtitle = chi_subtitle)
+p
+
+ggsave(p, filename = "figures/fibroblasts/fibroblast_PiePlot_CAFtype_bySex.pdf", width = 8, height = 6)
+
+# Same for subset seurat_fibro
+# Create df
+df <- as.data.frame(seurat_fibro@meta.data)  # Ensure it's a dataframe
+df$Sex <- as.factor(df$Sex)  # Convert Sex to factor
+df <- df[df$CAF_type != "tCAF", ]
+df$CAF_type <- as.factor(as.character(df$CAF_type))  # Convert CAF_type to factor
+df <- as.data.frame(table(df$Sex, df$CAF_type))
+colnames(df) <- c("Sex", "CAF_type", "Count")
+df <- df %>%
+  group_by(Sex) %>%
+  mutate(Proportion = Count / sum(Count)) %>%
+  ungroup()
+
+# Perform Chi-Square Test
+chi_test <- chisq.test(xtabs(Count ~ Sex + CAF_type, data = df))
+
+# Extract p-value and test statistic
+chi_subtitle <- paste0("Chi-Square Test: Chi² = ", round(chi_test$statistic, 2), 
+                       ", p = ", signif(chi_test$p.value, 3))
+
+# Barchart
+p <- ggplot(df, aes(x = Sex, y = Count, fill = CAF_type)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  theme_classic() +
+  labs(
+    y = "Proportion",
+    x = "Sex",
+    fill = "CAF Type",
+    title = "CAF Type Proportions by Sex",
+    subtitle = chi_subtitle
+  ) 
+p
+
+ggsave(p, filename = "figures/fibroblasts/fibroblastsubset_BarPlot_CAFtype_bySex.pdf", width = 8, height = 8)
+
+# Piechart
+p <- ggplot(df, aes(x = "", y = Proportion, fill = CAF_type)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y") +
+  facet_wrap(~Sex) +
+  theme_void() +
+  labs(title = "CAF Type Distribution by Sex", fill = "CAF Type", subtitle = chi_subtitle)
+p
+
+ggsave(p, filename = "figures/fibroblasts/fibroblastsubset_PiePlot_CAFtype_bySex.pdf", width = 8, height = 6)
+```
+
+```{r Circle plot/stacked barchart WITHOUT NORMAL}
+# seurat_fibro <- readRDS("data/seuratFibroAnnotated.RDS")
+# 
+# # Subset seurat_fibro to only contain tumor samples
+# seurat_fibro@meta.data$orig.ident <- as.character(seurat_fibro@meta.data$orig.ident)
+# cells_to_keep <- rownames(seurat_fibro@meta.data)[!grepl("^N", seurat_fibro@meta.data$orig.ident)]
+# seurat_subsetfibro <- subset(seurat_fibro, cells = cells_to_keep)
+# 
+# saveRDS(seurat_subsetfibro, "data/seuratFibroAnnotatedSubset.RDS")
+
+seurat_subsetfibro <- readRDS("data/seuratFibroAnnotatedSubset.RDS")
+
+# Create df
+df <- as.data.frame(seurat_subsetfibro@meta.data)  # Ensure it's a dataframe
+df$Sex <- as.factor(df$Sex)  # Convert Sex to factor
+df$CAF_type <- as.factor(df$CAF_type)  # Convert CAF_type to factor
+df <- as.data.frame(table(df$Sex, df$CAF_type))
+colnames(df) <- c("Sex", "CAF_type", "Count")
+df <- df %>%
+  group_by(Sex) %>%
+  mutate(Proportion = Count / sum(Count)) %>%
+  ungroup()
+
+# Perform Chi-Square Test
+chi_test <- chisq.test(xtabs(Count ~ Sex + CAF_type, data = df))
+
+# Extract p-value and test statistic
+chi_subtitle <- paste0("Chi-Square Test: Chi² = ", round(chi_test$statistic, 2), 
+                       ", p = ", signif(chi_test$p.value, 3))
+
+# Barchart
+p <- ggplot(df, aes(x = Sex, y = Count, fill = CAF_type)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  theme_classic() +
+  labs(
+    y = "Proportion",
+    x = "Sex",
+    fill = "CAF Type",
+    title = "CAF Type Proportions by Sex",
+    subtitle = chi_subtitle
+  ) 
+p
+
+ggsave(p, filename = "figures/fibroblasts/fibroblast_BarPlot_CAFtype_bySexWithoutNormal.pdf", width = 8, height = 8)
+
+# Piechart
+p <- ggplot(df, aes(x = "", y = Proportion, fill = CAF_type)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y") +
+  facet_wrap(~Sex) +
+  theme_void() +
+  labs(title = "CAF Type Distribution by Sex", fill = "CAF Type", subtitle = chi_subtitle)
+p
+
+ggsave(p, filename = "figures/fibroblasts/fibroblast_PiePlot_CAFtype_bySexWithoutNormal.pdf", width = 8, height = 6)
+
+# Same for subset seurat_subsetfibro
+# Create df
+df <- as.data.frame(seurat_subsetfibro@meta.data)  # Ensure it's a dataframe
+df$Sex <- as.factor(df$Sex)  # Convert Sex to factor
+df <- df[df$CAF_type != "tCAF", ]
+df$CAF_type <- as.factor(as.character(df$CAF_type))  # Convert CAF_type to factor
+df <- as.data.frame(table(df$Sex, df$CAF_type))
+colnames(df) <- c("Sex", "CAF_type", "Count")
+df <- df %>%
+  group_by(Sex) %>%
+  mutate(Proportion = Count / sum(Count)) %>%
+  ungroup()
+
+# Perform Chi-Square Test
+chi_test <- chisq.test(xtabs(Count ~ Sex + CAF_type, data = df))
+
+# Extract p-value and test statistic
+chi_subtitle <- paste0("Chi-Square Test: Chi² = ", round(chi_test$statistic, 2), 
+                       ", p = ", signif(chi_test$p.value, 3))
+
+# Barchart
+p <- ggplot(df, aes(x = Sex, y = Count, fill = CAF_type)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  theme_classic() +
+  labs(
+    y = "Proportion",
+    x = "Sex",
+    fill = "CAF Type",
+    title = "CAF Type Proportions by Sex",
+    subtitle = chi_subtitle
+  ) 
+p
+
+ggsave(p, filename = "figures/fibroblasts/fibroblastsubset_BarPlot_CAFtype_bySexWithoutNormal.pdf", width = 8, height = 8)
+
+# Piechart
+p <- ggplot(df, aes(x = "", y = Proportion, fill = CAF_type)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y") +
+  facet_wrap(~Sex) +
+  theme_void() +
+  labs(title = "CAF Type Distribution by Sex", fill = "CAF Type", subtitle = chi_subtitle)
+p
+
+ggsave(p, filename = "figures/fibroblasts/fibroblastsubset_PiePlot_CAFtype_bySexWithoutNormal.pdf", width = 8, height = 6)
+```
+
+```{r Absolute fibroblast count barplot by SampleType (Normal vs Tumor)}
+# Load data
+seurat_fibro <- readRDS("data/seuratFibroAnnotated.RDS")
+
+# Convert relevant metadata columns to factors
+seurat_fibro$SampleType <- as.factor(seurat_fibro$SampleType)
+seurat_fibro$CAF_type <- as.factor(seurat_fibro$CAF_type)
+
+# === WITH tCAF ===
+df_with_tCAF <- as.data.frame(table(seurat_fibro$SampleType, seurat_fibro$CAF_type))
+colnames(df_with_tCAF) <- c("SampleType", "CAF_type", "Count")
+
+# Plot absolute barplot
+p_with <- ggplot(df_with_tCAF, aes(x = SampleType, y = Count, fill = CAF_type)) +
+  geom_bar(stat = "identity", position = "stack") +
+  theme_classic() +
+  labs(
+    y = "CAF Count",
+    x = "Sample Type",
+    fill = "CAF Type",
+    title = "CAF Type Counts by Sample Type (with tCAF)"
+  )
+print(p_with)
+
+ggsave(p_with, filename = "figures/fibroblasts/fibroblast_BarPlot_CAFtype_bySampleType_with_tCAF.pdf", width = 8, height = 6)
+
+# === WITHOUT tCAF ===
+# Subset out tCAF
+meta_df <- seurat_fibro@meta.data
+meta_df <- meta_df[meta_df$CAF_type != "tCAF", ]
+meta_df$CAF_type <- droplevels(factor(meta_df$CAF_type))
+meta_df$SampleType <- as.factor(meta_df$SampleType)
+
+df_no_tCAF <- as.data.frame(table(meta_df$SampleType, meta_df$CAF_type))
+colnames(df_no_tCAF) <- c("SampleType", "CAF_type", "Count")
+
+# Plot absolute barplot
+p_no <- ggplot(df_no_tCAF, aes(x = SampleType, y = Count, fill = CAF_type)) +
+  geom_bar(stat = "identity", position = "stack") +
+  theme_classic() +
+  labs(
+    y = "CAF Count",
+    x = "Sample Type",
+    fill = "CAF Type",
+    title = "CAF Type Counts by Sample Type (without tCAF)"
+  )
+print(p_no)
+
+ggsave(p_no, filename = "figures/fibroblasts/fibroblast_BarPlot_CAFtype_bySampleType_without_tCAF.pdf", width = 8, height = 6)
+```
+
+
+# Correlation to epithelial features
+
+```{r Subset to epithelial cells proprocess and calculate basal/classical Z-scores}
+# Read in seurat_obj
+seurat_obj <- readRDS("data/seuratObjMeta.RDS")
+seurat_obj$cell_type
+unique(seurat_obj$cell_type)
+
+# Subsetting
+seurat_epithelial <- subset(x = seurat_obj, subset = cell_type == "Ductal cell type 1" | cell_type == "Ductal cell type 2")
+unique(seurat_epithelial$cell_type)
+table(seurat_epithelial$cell_type)
+
+# Save object
+saveRDS(seurat_epithelial, "data/seuratEpithelialSubset.RDS")
+
+# Preprocessing
+seurat_epithelial <- seurat_epithelial %>%
+  NormalizeData(normalization.method = "LogNormalize", verbose = TRUE) %>%
+  FindVariableFeatures(selection.method = "vst", nfeatures = 3000, verbose = TRUE) %>%
+  ScaleData(verbose = TRUE)
+
+# Save object
+saveRDS(seurat_epithelial, "data/seuratEpithelialProc.RDS")
+
+# Read in gene sets
+Basal_genes <- na.omit(read_excel("data/Moffitt PDAC signatures.xlsx", sheet = "Basal PDAC_Moffitt", col_names = FALSE)[[1]])
+Classical_genes <- na.omit(read_excel("data/Moffitt PDAC signatures.xlsx", sheet = "Classical PDAC_Moffitt", col_names = FALSE)[[1]])
+estrogenBiosyntesis_genes <- read_excel("data/Manoukian_Table S1.xls", sheet = "Estrogen_Biosynthesis", col_names = FALSE)[[1]][-1]
+
+
+gene_sets <- list(
+  Basal = Basal_genes,
+  Classical = Classical_genes,
+  estrogenBiosyntesis = estrogenBiosyntesis_genes
+)
+
+# Subset seurat_epithelial to only contain tumor samples
+seurat_epithelial@meta.data$orig.ident <- as.character(seurat_epithelial@meta.data$orig.ident)
+cells_to_keep <- rownames(seurat_epithelial@meta.data)[!grepl("^N", seurat_epithelial@meta.data$orig.ident)]
+seurat_subsetepithelial <- subset(seurat_epithelial, cells = cells_to_keep)
+
+saveRDS(seurat_subsetepithelial, "data/seuratEpithelialProcSubset.RDS")
+
+# Automated filtering and Z-score calculation
+for (gene_set in names(gene_sets)) {
+  # Filter gene set to include only genes present in the Seurat object
+  filtered_genes <- gene_sets[[gene_set]][gene_sets[[gene_set]] %in% rownames(seurat_epithelial)]
+  # Skip this gene set if no genes are found
+  if (length(filtered_genes) == 0) {
+    message(paste("No matching genes found for", gene_set, "- skipping."))
+    next
+  }
+  
+   # Add module score for the gene set
+  seurat_subsetepithelial <- AddModuleScore(
+    seurat_subsetepithelial, 
+    features = list(filtered_genes), 
+    name = paste0(gene_set, "_Score")
+  )
+  
+  # Extract the module score column name (Seurat appends '1' at the end)
+  module_score_col <- paste0(gene_set, "_Score1")
+
+  # Calculate Z-score for the module score across all cells
+  seurat_subsetepithelial@meta.data[[paste0(gene_set, "_Zscore")]] <- (seurat_subsetepithelial@meta.data[[module_score_col]] - mean(seurat_subsetepithelial@meta.data[[module_score_col]])) / sd(seurat_subsetepithelial@meta.data[[module_score_col]])
+}
+
+# Save seurat object with CAF gene signatures
+saveRDS(seurat_subsetepithelial, file="data/seuratEpithelialProcSubset_BasalClassicalsig.RDS")
+
+# Create metadata object and save
+meta_data <- as.data.frame(seurat_subsetepithelial@meta.data)
+write.csv(meta_data, "data/epithelialSubsetMetadata.csv", row.names = FALSE)
+```
+
+```{r Correlation i/myCAF Z-scores to basal/classical Z-scores}
+# Load data
+fibroblast_metadata <- read.csv("data/fibroblastSubsetMetadata.csv")
+epithelial_metadata <- read.csv("data/epithelialSubsetMetadata.csv")
+
+# Compute average scores per patient
+fibro_avg <- fibroblast_metadata %>%
+  group_by(orig.ident, Sex) %>%
+  summarize(across(ends_with("Zscore"), mean, na.rm = TRUE),  # Compute mean Z-score
+    myCAF_prop = sum(CAF_type == "myCAF", na.rm = TRUE) / n(),  # Proportion of myCAF
+    iCAF_prop = sum(CAF_type == "iCAF", na.rm = TRUE) / n()     # Proportion of iCAF
+  )
+epi_avg <- epithelial_metadata %>%
+  group_by(orig.ident, Sex) %>%
+  summarize(across(ends_with("Zscore"), mean, na.rm = TRUE))
+
+# Add a new column for Basal/Classical ratio
+epi_avg <- epi_avg %>%
+  mutate(Basal_Classical_Ratio = Basal_Zscore / Classical_Zscore)
+
+# Merge the summarized datasets
+merged_avg <- inner_join(fibro_avg, epi_avg, by = c("orig.ident", "Sex"))
+merged_avg <- merged_avg %>%
+  filter(!grepl("^N", orig.ident))
+
+# List of CAF and epithelial signatures
+CAF_signatures <- c("iCAF", "myCAF")
+Epithelial_signatures <- c("Basal", "Classical")
+
+# Loop through each CAF signature to create scatterplots
+for (caf in CAF_signatures) {
+    for (epi in Epithelial_signatures) {
+  caf_column <- paste0(caf, "_Zscore")
+  epi_column <- paste0(epi, "_Zscore")
+  
+  # Correlation analysis
+  cor_test <- cor.test(
+    merged_avg[[caf_column]],
+    merged_avg[[epi_column]],
+    method = "pearson"
+  )
+  
+  # Extract correlation results
+  r_value <- round(cor_test$estimate, 2)
+  p_value <- signif(cor_test$p.value, 3)
+  
+  # Scatter plot
+  p <- ggplot(merged_avg, aes(x = .data[[caf_column]], y = .data[[epi_column]])) +
+    geom_point(alpha = 0.6) +
+    geom_smooth(method = "lm", se = FALSE, color = "red", linetype = "dashed") +
+    theme_classic() +
+    labs(
+      title = paste(caf, "Z-score vs.", epi, "Z-score"),
+      subtitle = paste("Pearson r =", r_value, "p =", p_value),
+      x = paste(caf, "Z-Score"),
+      y = paste(epi, "Z-Score")
+    ) +
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      axis.title = element_text(size = 12)
+    )
+  
+  print(p)
+  
+  # Save the plot
+  ggsave(
+    filename = paste0("figures/ScatterPlot_", caf_column, "_vs_", epi_column, ".pdf"),
+    plot = p,
+    width = 8,
+    height = 8
+  )
+  }
+}
+
+# Loop through each CAF signature to create scatterplots
+for (caf in CAF_signatures) {
+    for (epi in Epithelial_signatures) {
+  caf_column <- paste0(caf, "_Zscore")
+  epi_column <- paste0(epi, "_Zscore")
+  
+  # Calculate regression statistics (r and p-value) for each Sex
+  sex_stats <- merged_avg %>%
+    group_by(Sex) %>%
+    summarize(
+      r_value = round(cor(.data[[caf_column]], .data[[epi_column]], use = "complete.obs"), 2),
+      p_value = signif(cor.test(.data[[caf_column]], .data[[epi_column]])$p.value, 3),
+      intercept = coef(lm(.data[[epi_column]] ~ .data[[caf_column]]))[1],
+      slope = coef(lm(.data[[epi_column]] ~ .data[[caf_column]]))[2],
+      .groups = "drop"
+    )
+  
+  # Prepare annotation text for each Sex
+  sex_stats <- sex_stats %>%
+    mutate(
+      annotation = paste0("\n", "r = ", r_value, ", p = ", p_value)
+    )
+  
+  # Scatter plot split by Sex
+  p <- ggplot(merged_avg, aes(x = .data[[caf_column]], y = .data[[epi_column]], color = Sex)) +
+    geom_point(alpha = 0.6) +
+    geom_smooth(method = "lm", aes(group = Sex), se = FALSE, linetype = "dashed") + # Separate regression lines per Sex
+    theme_classic() +
+    labs(
+      title = paste(caf, "Z-Score vs.", epi, "Z-Score"),
+      x = paste(caf, "Z-Score"),
+      y = paste(epi, "Z-Score"),
+      color = "Sex"
+    ) +
+    facet_wrap(~Sex, ncol = 2) + # Create side-by-side panels for each Sex
+    theme(
+      aspect.ratio = 1,
+      plot.title = element_text(size = 14, face = "bold"),
+      plot.subtitle = element_text(size = 12, face = "italic"),
+      axis.title = element_text(size = 12),
+      strip.text = element_text(size = 12)
+    ) +
+    # Add annotations for each Sex panel
+    geom_text(
+      data = sex_stats, 
+      aes(
+        label = annotation, 
+        x = Inf, y = -Inf
+      ),
+      inherit.aes = FALSE,
+      hjust = 1.1, 
+      vjust = -1,
+      size = 3
+    )
+  
+  # Save the plot
+  ggsave(
+    filename = paste0("figures/ScatterPlot_", caf_column, "_vs_", epi_column, "_splitSex.pdf"),
+    plot = p,
+    width = 8,
+    height = 8
+  )
+    }
+}
+
+```
+
+```{r Correlation i/myCAF/activated/normal Z-scores to estrogen biosynthesis Z-score}
+# Load data
+fibroblast_metadata <- read.csv("data/fibroblastSubsetMetadata.csv")
+epithelial_metadata <- read.csv("data/epithelialSubsetMetadata.csv")
+
+# Compute average scores per patient
+fibro_avg <- fibroblast_metadata %>%
+  group_by(orig.ident, Sex) %>%
+  summarize(across(ends_with("Zscore"), mean, na.rm = TRUE),  # Compute mean Z-score
+    myCAF_prop = sum(CAF_type == "myCAF", na.rm = TRUE) / n(),  # Proportion of myCAF
+    iCAF_prop = sum(CAF_type == "iCAF", na.rm = TRUE) / n()     # Proportion of iCAF
+  )
+epi_avg <- epithelial_metadata %>%
+  group_by(orig.ident, Sex) %>%
+  summarize(across(ends_with("Zscore"), mean, na.rm = TRUE))
+
+# Add a new column for Basal/Classical ratio
+epi_avg <- epi_avg %>%
+  mutate(Basal_Classical_Ratio = Basal_Zscore / Classical_Zscore)
+
+# Merge the summarized datasets
+merged_avg <- inner_join(fibro_avg, epi_avg, by = c("orig.ident", "Sex"))
+merged_avg <- merged_avg %>%
+  filter(!grepl("^N", orig.ident))
+
+# List of CAF and epithelial signatures
+CAF_signatures <- c("iCAF", "myCAF", "activatedStroma", "normalStroma")
+Epithelial_signatures <- c("estrogenBiosyntesis")
+
+# Loop through each CAF signature to create scatterplots
+for (caf in CAF_signatures) {
+    for (epi in Epithelial_signatures) {
+  caf_column <- paste0(caf, "_Zscore")
+  epi_column <- paste0(epi, "_Zscore")
+  
+  # Correlation analysis
+  cor_test <- cor.test(
+    merged_avg[[caf_column]],
+    merged_avg[[epi_column]],
+    method = "pearson"
+  )
+  
+  # Extract correlation results
+  r_value <- round(cor_test$estimate, 2)
+  p_value <- signif(cor_test$p.value, 3)
+  
+  # Scatter plot
+  p <- ggplot(merged_avg, aes(x = .data[[caf_column]], y = .data[[epi_column]])) +
+    geom_point(alpha = 0.6) +
+    geom_smooth(method = "lm", se = FALSE, color = "red", linetype = "dashed") +
+    theme_classic() +
+    labs(
+      title = paste(caf, "Z-score vs.", epi, "Z-score"),
+      subtitle = paste("Pearson r =", r_value, "p =", p_value),
+      x = paste(caf, "Z-Score"),
+      y = paste(epi, "Z-Score")
+    ) +
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      axis.title = element_text(size = 12)
+    )
+  
+  print(p)
+  
+  # Save the plot
+  ggsave(
+    filename = paste0("figures/ScatterPlot_", caf_column, "_vs_", epi_column, ".pdf"),
+    plot = p,
+    width = 8,
+    height = 8
+  )
+  }
+}
+
+# Loop through each CAF signature to create scatterplots
+for (caf in CAF_signatures) {
+    for (epi in Epithelial_signatures) {
+  caf_column <- paste0(caf, "_Zscore")
+  epi_column <- paste0(epi, "_Zscore")
+  
+  # Calculate regression statistics (r and p-value) for each Sex
+  sex_stats <- merged_avg %>%
+    group_by(Sex) %>%
+    summarize(
+      r_value = round(cor(.data[[caf_column]], .data[[epi_column]], use = "complete.obs"), 2),
+      p_value = signif(cor.test(.data[[caf_column]], .data[[epi_column]])$p.value, 3),
+      intercept = coef(lm(.data[[epi_column]] ~ .data[[caf_column]]))[1],
+      slope = coef(lm(.data[[epi_column]] ~ .data[[caf_column]]))[2],
+      .groups = "drop"
+    )
+  
+  # Prepare annotation text for each Sex
+  sex_stats <- sex_stats %>%
+    mutate(
+      annotation = paste0("\n", "r = ", r_value, ", p = ", p_value)
+    )
+  
+  # Scatter plot split by Sex
+  p <- ggplot(merged_avg, aes(x = .data[[caf_column]], y = .data[[epi_column]], color = Sex)) +
+    geom_point(alpha = 0.6) +
+    geom_smooth(method = "lm", aes(group = Sex), se = FALSE, linetype = "dashed") + # Separate regression lines per Sex
+    theme_classic() +
+    labs(
+      title = paste(caf, "Z-Score vs.", epi, "Z-Score"),
+      x = paste(caf, "Z-Score"),
+      y = paste(epi, "Z-Score"),
+      color = "Sex"
+    ) +
+    facet_wrap(~Sex, ncol = 2) + # Create side-by-side panels for each Sex
+    theme(
+      aspect.ratio = 1,
+      plot.title = element_text(size = 14, face = "bold"),
+      plot.subtitle = element_text(size = 12, face = "italic"),
+      axis.title = element_text(size = 12),
+      strip.text = element_text(size = 12)
+    ) +
+    # Add annotations for each Sex panel
+    geom_text(
+      data = sex_stats, 
+      aes(
+        label = annotation, 
+        x = Inf, y = -Inf
+      ),
+      inherit.aes = FALSE,
+      hjust = 1.1, 
+      vjust = -1,
+      size = 3
+    )
+  
+  # Save the plot
+  ggsave(
+    filename = paste0("figures/ScatterPlot_", caf_column, "_vs_", epi_column, "_splitSex.pdf"),
+    plot = p,
+    width = 8,
+    height = 8
+  )
+    }
+}
+```
+
+```{r Correlation i/myCAF proportions to basal/classical Z-scores}
+# Loop through each CAF signature to create scatterplots
+for (caf in CAF_signatures) {
+    for (epi in Epithelial_signatures) {
+  caf_column <- paste0(caf, "_prop")
+  epi_column <- paste0(epi, "_Zscore")
+  
+  # Correlation analysis
+  cor_test <- cor.test(
+    merged_avg[[caf_column]],
+    merged_avg[[epi_column]],
+    method = "pearson"
+  )
+  
+  # Extract correlation results
+  r_value <- round(cor_test$estimate, 2)
+  p_value <- signif(cor_test$p.value, 3)
+  
+  # Scatter plot
+  p <- ggplot(merged_avg, aes(x = .data[[caf_column]], y = .data[[epi_column]])) +
+    geom_point(alpha = 0.6) +
+    geom_smooth(method = "lm", se = FALSE, color = "red", linetype = "dashed") +
+    theme_classic() +
+    labs(
+      title = paste(caf, "proportion vs.", epi, "Z-score"),
+      subtitle = paste("Pearson r =", r_value, "p =", p_value),
+      x = paste(caf, "proportion"),
+      y = paste(epi, "Z-Score")
+    ) +
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      axis.title = element_text(size = 12)
+    )
+  
+  print(p)
+  
+  # Save the plot
+  ggsave(
+    filename = paste0("figures/ScatterPlot_", caf_column, "_vs_", epi_column, ".pdf"),
+    plot = p,
+    width = 8,
+    height = 8
+  )
+  }
+}
+
+# Loop through each CAF signature to create scatterplots
+for (caf in CAF_signatures) {
+    for (epi in Epithelial_signatures) {
+  caf_column <- paste0(caf, "_prop")
+  epi_column <- paste0(epi, "_Zscore")
+  
+  # Calculate regression statistics (r and p-value) for each Sex
+  sex_stats <- merged_avg %>%
+    group_by(Sex) %>%
+    summarize(
+      r_value = round(cor(.data[[caf_column]], .data[[epi_column]], use = "complete.obs"), 2),
+      p_value = signif(cor.test(.data[[caf_column]], .data[[epi_column]])$p.value, 3),
+      intercept = coef(lm(.data[[epi_column]] ~ .data[[caf_column]]))[1],
+      slope = coef(lm(.data[[epi_column]] ~ .data[[caf_column]]))[2],
+      .groups = "drop"
+    )
+  
+  # Prepare annotation text for each Sex
+  sex_stats <- sex_stats %>%
+    mutate(
+      annotation = paste0("\n", "r = ", r_value, ", p = ", p_value)
+    )
+  
+  # Scatter plot split by Sex
+  p <- ggplot(merged_avg, aes(x = .data[[caf_column]], y = .data[[epi_column]], color = Sex)) +
+    geom_point(alpha = 0.6) +
+    geom_smooth(method = "lm", aes(group = Sex), se = FALSE, linetype = "dashed") + # Separate regression lines per Sex
+    theme_classic() +
+    labs(
+      title = paste(caf, "proportion vs.", epi, "Z-Score"),
+      x = paste(caf, "proportion"),
+      y = paste(epi, "Z-Score"),
+      color = "Sex"
+    ) +
+    facet_wrap(~Sex, ncol = 2) + # Create side-by-side panels for each Sex
+    theme(
+      aspect.ratio = 1,
+      plot.title = element_text(size = 14, face = "bold"),
+      plot.subtitle = element_text(size = 12, face = "italic"),
+      axis.title = element_text(size = 12),
+      strip.text = element_text(size = 12)
+    ) +
+    # Add annotations for each Sex panel
+    geom_text(
+      data = sex_stats, 
+      aes(
+        label = annotation, 
+        x = Inf, y = -Inf
+      ),
+      inherit.aes = FALSE,
+      hjust = 1.1, 
+      vjust = -1,
+      size = 3
+    )
+  
+  # Save the plot
+  ggsave(
+    filename = paste0("figures/ScatterPlot_", caf_column, "_vs_", epi_column, "_splitSex.pdf"),
+    plot = p,
+    width = 8,
+    height = 8
+  )
+    }
+}
+
+```
+
+```{r Correlation i/myCAF Z-scores to basal/classical ratio}
+# Loop through each CAF signature to create scatterplots for Basal/Classical Ratio
+for (caf in CAF_signatures) {
+  caf_column <- paste0(caf, "_Zscore")
+  
+  # Correlation analysis
+  cor_test <- cor.test(
+    merged_avg[[caf_column]],
+    merged_avg$Basal_Classical_Ratio,
+    method = "pearson"
+  )
+  
+  # Extract correlation results
+  r_value <- round(cor_test$estimate, 2)
+  p_value <- signif(cor_test$p.value, 3)
+  
+  # Unsplit scatter plot
+  p_unsplit <- ggplot(merged_avg, aes(x = .data[[caf_column]], y = Basal_Classical_Ratio)) +
+    geom_point(alpha = 0.6) +
+    geom_smooth(method = "lm", se = FALSE, color = "red", linetype = "dashed") +
+    theme_classic() +
+    labs(
+      title = paste("Unsplit:", caf, "vs. Basal/Classical Ratio"),
+      subtitle = paste("Pearson r =", r_value, "p =", p_value),
+      x = paste(caf, "Z-Score"),
+      y = "Basal/Classical Ratio"
+    ) +
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      axis.title = element_text(size = 12)
+    )
+  
+  # Save unsplit plot
+  ggsave(
+    filename = paste0("figures/ScatterPlot_", caf_column, "_vs_Basal_Classical_Ratio.pdf"),
+    plot = p_unsplit,
+    width = 8,
+    height = 8
+  )
+  
+  # Scatter plot split by Sex with separate regression lines
+  p_split_sex <- ggplot(merged_avg, aes(x = .data[[caf_column]], y = Basal_Classical_Ratio, color = Sex)) +
+    geom_point(alpha = 0.6) +
+    geom_smooth(aes(group = Sex), method = "lm", se = FALSE, linetype = "dashed") +  # Separate regression lines per Sex
+    theme_classic() +
+    labs(
+      title = paste(caf, "vs. Basal/Classical Ratio (Split by Sex)"),
+      x = paste(caf, "Z-Score"),
+      y = "Basal/Classical Ratio",
+      color = "Sex"
+    ) +
+    facet_wrap(~Sex, ncol = 2) +  # Create side-by-side panels for each Sex
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      axis.title = element_text(size = 12)
+    )
+  
+  # Save plot split by Sex
+  ggsave(
+    filename = paste0("figures/ScatterPlot_", caf_column, "_vs_Basal_Classical_Ratio_splitSex.pdf"),
+    plot = p_split_sex,
+    width = 10,
+    height = 6
+  )
+}
+
+# Loop through each CAF signature to create scatterplots
+for (caf in CAF_signatures) {
+  caf_column <- paste0(caf, "_Zscore")
+  
+  # Calculate regression statistics (r and p-value) for each Sex
+  sex_stats <- merged_avg %>%
+    group_by(Sex) %>%
+    summarize(
+      r_value = round(cor(.data[[caf_column]], Basal_Classical_Ratio, use = "complete.obs"), 2),
+      p_value = signif(cor.test(.data[[caf_column]], Basal_Classical_Ratio)$p.value, 3),
+      intercept = coef(lm(Basal_Classical_Ratio ~ .data[[caf_column]]))[1],
+      slope = coef(lm(Basal_Classical_Ratio ~ .data[[caf_column]]))[2],
+      .groups = "drop"
+    )
+  
+  # Prepare annotation text for each Sex
+  sex_stats <- sex_stats %>%
+    mutate(
+      annotation = paste0("\n", "r = ", r_value, ", p = ", p_value)
+    )
+  
+  # Scatter plot split by Sex
+  p <- ggplot(merged_avg, aes(x = .data[[caf_column]], y = Basal_Classical_Ratio, color = Sex)) +
+    geom_point(alpha = 0.6) +
+    geom_smooth(method = "lm", aes(group = Sex), se = FALSE, linetype = "dashed") + # Separate regression lines per Sex
+    theme_classic() +
+    labs(
+      title = paste(caf, "vs. Basal/Classical Ratio (Split by Sex)"),
+      x = paste(caf, "Z-Score"),
+      y = "Basal/Classical Ratio",
+      color = "Sex"
+    ) +
+    facet_wrap(~Sex, ncol = 2) + # Create side-by-side panels for each Sex
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      plot.subtitle = element_text(size = 12, face = "italic"),
+      axis.title = element_text(size = 12),
+      strip.text = element_text(size = 12)
+    ) +
+    # Add annotations for each Sex panel
+    geom_text(
+      data = sex_stats, 
+      aes(
+        label = annotation, 
+        x = Inf, y = -Inf
+      ),
+      inherit.aes = FALSE,
+      hjust = 1.1, 
+      vjust = -1,
+      size = 3
+    )
+  
+  # Save the plot
+  ggsave(
+    filename = paste0("figures/ScatterPlot_", caf_column, "_vs_Basal_Classical_Ratio_splitSex.pdf"),
+    plot = p,
+    width = 10,
+    height = 6
+  )
+}
+```
+
+```{r Correlation i/myCAF proportion to basal/classical ratio}
+# Loop through each CAF signature to create scatterplots for Basal/Classical Ratio
+for (caf in CAF_signatures) {
+  caf_column <- paste0(caf, "_prop")
+  
+  # Correlation analysis
+  cor_test <- cor.test(
+    merged_avg[[caf_column]],
+    merged_avg$Basal_Classical_Ratio,
+    method = "pearson"
+  )
+  
+  # Extract correlation results
+  r_value <- round(cor_test$estimate, 2)
+  p_value <- signif(cor_test$p.value, 3)
+  
+  # Unsplit scatter plot
+  p_unsplit <- ggplot(merged_avg, aes(x = .data[[caf_column]], y = Basal_Classical_Ratio)) +
+    geom_point(alpha = 0.6) +
+    geom_smooth(method = "lm", se = FALSE, color = "red", linetype = "dashed") +
+    theme_classic() +
+    labs(
+      title = paste("Unsplit:", caf, "proportion vs. Basal/Classical Ratio"),
+      subtitle = paste("Pearson r =", r_value, "p =", p_value),
+      x = paste(caf, "proportion"),
+      y = "Basal/Classical Ratio"
+    ) +
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      axis.title = element_text(size = 12)
+    )
+  
+  # Save unsplit plot
+  ggsave(
+    filename = paste0("figures/ScatterPlot_", caf_column, "_vs_Basal_Classical_Ratio.pdf"),
+    plot = p_unsplit,
+    width = 8,
+    height = 8
+  )
+}
+
+# Loop through each CAF signature to create scatterplots
+for (caf in CAF_signatures) {
+  caf_column <- paste0(caf, "_prop")
+  
+  # Calculate regression statistics (r and p-value) for each Sex
+  sex_stats <- merged_avg %>%
+    group_by(Sex) %>%
+    summarize(
+      r_value = round(cor(.data[[caf_column]], Basal_Classical_Ratio, use = "complete.obs"), 2),
+      p_value = signif(cor.test(.data[[caf_column]], Basal_Classical_Ratio)$p.value, 3),
+      intercept = coef(lm(Basal_Classical_Ratio ~ .data[[caf_column]]))[1],
+      slope = coef(lm(Basal_Classical_Ratio ~ .data[[caf_column]]))[2],
+      .groups = "drop"
+    )
+  
+  # Prepare annotation text for each Sex
+  sex_stats <- sex_stats %>%
+    mutate(
+      annotation = paste0("\n", "r = ", r_value, ", p = ", p_value)
+    )
+  
+  # Scatter plot split by Sex
+  p <- ggplot(merged_avg, aes(x = .data[[caf_column]], y = Basal_Classical_Ratio, color = Sex)) +
+    geom_point(alpha = 0.6) +
+    geom_smooth(method = "lm", aes(group = Sex), se = FALSE, linetype = "dashed") + # Separate regression lines per Sex
+    theme_classic() +
+    labs(
+      title = paste(caf, "vs. Basal/Classical Ratio (Split by Sex)"),
+      x = paste(caf, "proportion"),
+      y = "Basal/Classical Ratio",
+      color = "Sex"
+    ) +
+    facet_wrap(~Sex, ncol = 2) + # Create side-by-side panels for each Sex
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      plot.subtitle = element_text(size = 12, face = "italic"),
+      axis.title = element_text(size = 12),
+      strip.text = element_text(size = 12)
+    ) +
+    # Add annotations for each Sex panel
+    geom_text(
+      data = sex_stats, 
+      aes(
+        label = annotation, 
+        x = Inf, y = -Inf
+      ),
+      inherit.aes = FALSE,
+      hjust = 1.1, 
+      vjust = -1,
+      size = 3
+    )
+  
+  # Save the plot
+  ggsave(
+    filename = paste0("figures/ScatterPlot_", caf_column, "_vs_Basal_Classical_Ratio_splitSex.pdf"),
+    plot = p,
+    width = 10,
+    height = 6
+  )
+}
+```
